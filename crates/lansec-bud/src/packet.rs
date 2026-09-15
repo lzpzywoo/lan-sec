@@ -34,6 +34,7 @@ pub struct PacketHeader {
     pub ty: PacketType,
     pub channel: Channel,
     pub flags: u8,
+    pub epoch: u8,
     pub seq: u32,
     pub frame_id: u32,
     pub frag_idx: u16,
@@ -53,7 +54,7 @@ impl PacketHeader {
         buf[4] = self.ty as u8;
         buf[5] = self.channel as u8;
         buf[6] = self.flags;
-        buf[7] = 0;
+        buf[7] = self.epoch;
         buf[8..12].copy_from_slice(&self.seq.to_le_bytes());
         buf[12..16].copy_from_slice(&self.frame_id.to_le_bytes());
         buf[16..18].copy_from_slice(&self.frag_idx.to_le_bytes());
@@ -72,6 +73,7 @@ impl PacketHeader {
             ty: PacketType::from_u8(buf[4])?,
             channel: Channel::from_u8(buf[5])?,
             flags: buf[6],
+            epoch: buf[7],
             seq: u32::from_le_bytes(buf[8..12].try_into().ok()?),
             frame_id: u32::from_le_bytes(buf[12..16].try_into().ok()?),
             frag_idx: u16::from_le_bytes(buf[16..18].try_into().ok()?),
@@ -102,6 +104,7 @@ mod tests {
             ty: PacketType::Data,
             channel: Channel::Video,
             flags: FLAG_KEYFRAME,
+            epoch: 3,
             seq: 42,
             frame_id: 7,
             frag_idx: 1,
@@ -112,5 +115,6 @@ mod tests {
         assert_eq!(back.seq, 42);
         assert_eq!(back.frag_count, 3);
         assert_eq!(back.flags, FLAG_KEYFRAME);
+        assert_eq!(back.epoch, 3);
     }
 }

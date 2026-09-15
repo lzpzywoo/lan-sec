@@ -16,30 +16,36 @@ use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
+#[cfg(windows)]
+use winit::platform::windows::WindowAttributesExtWindows;
 
 use crate::keys;
 use crate::local_caps;
 
 pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
+    info!(%connect, "client connecting");
+    let local = local_caps();
+    #[cfg(windows)]
+    let gpu = lansec_capture::GpuContext::new().ok();
+    let player = Player::start().ok();
     let bud = BudEndpoint::bind(BudConfig {
         bind: "0.0.0.0:0".parse().unwrap(),
         pin,
         is_host: false,
     })?;
     bud.connect(connect)?;
-    info!(%connect, "client connecting");
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = ClientApp {
         bud,
-        local: local_caps(),
+        local,
         decoder: None,
         presenter: Presenter::new(60.0),
         opus: OpusRoundtrip::new().ok(),
-        player: Player::start().ok(),
+        player,
         window: None,
         #[cfg(windows)]
-        gpu: lansec_capture::GpuContext::new().ok(),
+        gpu,
         #[cfg(windows)]
         swap: None,
         #[cfg(target_os = "macos")]
@@ -49,6 +55,7 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         last_cong: Instant::now(),
         clock: SessionClock::new(),
         video_frames: 0,
+        video_without_decoder: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -73,6 +80,7 @@ struct ClientApp {
     last_cong: Instant,
     clock: SessionClock,
     video_frames: u64,
+    video_without_decoder: u64,
 }
 
 impl ClientApp {
@@ -106,25 +114,21 @@ impl ClientApp {
                     ..
                 } => match decode::<ControlMsg>(&payload) {
                     Ok(ControlMsg::CapsOffer(remote)) => {
-                        match lansec_protocol::negotiate(&remote, &self.local) {
-                            Some(fmt) => {
-                                info!(chroma = fmt.chroma_label(), "negotiated");
-                                println!("stream format: {}", fmt.chroma_label());
-                                self.host_w = fmt.width.max(1);
-                                self.host_h = fmt.height.max(1);
-                                self.open_decoder(fmt.chroma, fmt.width as u32, fmt.height as u32);
-                                if let Ok(bytes) = encode(&ControlMsg::CapsAccept { format: fmt }) {
-                                    let _ = self.bud.send(Channel::Control, &bytes, 0, true);
-                                }
-                            }
-                            None => warn!("no common codec"),
-                        }
+                        info!(
+                            encode = remote.encode.len(),
+                            decode = remote.decode.len(),
+                            "host caps received; waiting for CapsAccept"
+                        );
                     }
                     Ok(ControlMsg::CapsAccept { format: fmt }) => {
+                        info!(chroma = fmt.chroma_label(), width = fmt.width, height = fmt.height, "negotiated");
                         println!("stream format: {}", fmt.chroma_label());
                         self.host_w = fmt.width.max(1);
                         self.host_h = fmt.height.max(1);
                         self.open_decoder(fmt.chroma, fmt.width as u32, fmt.height as u32);
+                        if let Ok(bytes) = encode(&ControlMsg::RequestIdr) {
+                            let _ = self.bud.send(Channel::Control, &bytes, 0, true);
+                        }
                     }
                     Ok(ControlMsg::Bye) => {}
                     Ok(_) => {}
@@ -175,6 +179,18 @@ impl ClientApp {
         } else {
             warn!("hardware decoder unavailable");
         }
+        self.invalidate_present_targets();
+    }
+
+    fn invalidate_present_targets(&mut self) {
+        #[cfg(windows)]
+        {
+            self.swap = None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.metal = None;
+        }
     }
 
     fn on_video(&mut self, au: &mut VideoAccessUnit) {
@@ -192,6 +208,25 @@ impl ClientApp {
             au.times.send_us = mapped_send;
         }
         au.times.recv_us = recv;
+        if self.decoder.is_none() {
+            self.video_without_decoder += 1;
+            if self.video_without_decoder == 1 || self.video_without_decoder % 120 == 0 {
+                warn!(
+                    n = self.video_without_decoder,
+                    w = au.width,
+                    h = au.height,
+                    key = au.is_keyframe,
+                    "video arrived before decoder; requesting IDR after CapsAccept"
+                );
+            }
+            if au.is_keyframe && au.width > 0 {
+                // Last-resort: still no CapsAccept. Decode 4:2:0 at the AU size.
+                self.open_decoder(lansec_protocol::Chroma::Yuv420, au.width as u32, au.height as u32);
+                if let Ok(bytes) = encode(&ControlMsg::RequestIdr) {
+                    let _ = self.bud.send(Channel::Control, &bytes, 0, true);
+                }
+            }
+        }
         if let Some(dec) = self.decoder.as_mut() {
             match dec.decode(&au.annexb, au.is_keyframe) {
                 Ok(Some(frame)) => {
@@ -246,6 +281,11 @@ impl ClientApp {
             return;
         };
         #[cfg(windows)]
+        if self.swap.as_ref().is_some_and(|s| s.width != self.host_w.max(1) as u32 || s.height != self.host_h.max(1) as u32)
+        {
+            self.swap = None;
+        }
+        #[cfg(windows)]
         if self.swap.is_none() {
             if let Some(gpu) = self.gpu.as_ref() {
                 if let Ok(hwnd) = lansec_present::windows_swapchain::Swapchain::hwnd_from_winit(window) {
@@ -284,11 +324,24 @@ impl ApplicationHandler for ClientApp {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            let attrs = Window::default_attributes()
+            let mut attrs = Window::default_attributes()
                 .with_title("lansec")
                 .with_inner_size(winit::dpi::PhysicalSize::new(self.host_w.max(640), self.host_h.max(360)));
+            // MF/WASAPI already called CoInitializeEx(COINIT_MULTITHREADED) on this thread.
+            // winit's default drag-and-drop path calls OleInitialize (STA) and panics with
+            // RPC_E_CHANGED_MODE. We do not need file drop on the viewer.
+            #[cfg(windows)]
+            {
+                attrs = attrs.with_drag_and_drop(false);
+            }
             match event_loop.create_window(attrs) {
-                Ok(w) => self.window = Some(w),
+                Ok(w) => {
+                    #[cfg(windows)]
+                    if let Ok(hwnd) = lansec_present::windows_swapchain::Swapchain::hwnd_from_winit(&w) {
+                        lansec_present::windows_swapchain::Swapchain::exclude_from_capture(hwnd);
+                    }
+                    self.window = Some(w);
+                }
                 Err(e) => warn!("window: {e}"),
             }
             self.ensure_present_targets();

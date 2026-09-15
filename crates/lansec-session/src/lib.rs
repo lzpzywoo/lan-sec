@@ -77,9 +77,12 @@ pub fn run_loopback() -> Result<()> {
     let mut presenter = lansec_present::Presenter::new(60.0);
 
     #[cfg(windows)]
-    let swap = {
-        let hwnd = lansec_present::windows_swapchain::Swapchain::create_window("lansec loopback", w, h).ok();
-        match (hwnd, decoder.as_ref()) {
+    let (hwnd, swap) = {
+        // Preview is smaller than the desktop so a missed capture-exclude cannot cover the screen.
+        let pw = (w / 2).clamp(640, 1280);
+        let ph = (h / 2).clamp(360, 720);
+        let hwnd = lansec_present::windows_swapchain::Swapchain::create_window("lansec loopback", pw, ph).ok();
+        let swap = match (hwnd, decoder.as_ref()) {
             (Some(hwnd), Some(_)) => lansec_present::windows_swapchain::Swapchain::from_hwnd(
                 &capture.gpu().device,
                 capture.gpu().context.clone(),
@@ -89,13 +92,18 @@ pub fn run_loopback() -> Result<()> {
             )
             .ok(),
             _ => None,
-        }
+        };
+        (hwnd, swap)
     };
 
     let mut n = 0u32;
     let mut decoded = 0u32;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
+        #[cfg(windows)]
+        if !lansec_present::windows_swapchain::Swapchain::pump_thread_messages() {
+            break;
+        }
         if let Some(frame) = capture.next_frame()? {
             if let Some(au) = encoder.encode(&frame, n == 0)? {
                 n += 1;
@@ -120,5 +128,13 @@ pub fn run_loopback() -> Result<()> {
     }
     info!(encoded = n, decoded, dropped = presenter.stats().dropped, "loopback done");
     println!("loopback encoded={n} decoded={decoded} chroma={:?}", encoder.chroma());
+    #[cfg(windows)]
+    {
+        drop(swap);
+        if let Some(hwnd) = hwnd {
+            lansec_present::windows_swapchain::Swapchain::destroy_window(hwnd);
+            let _ = lansec_present::windows_swapchain::Swapchain::pump_thread_messages();
+        }
+    }
     Ok(())
 }

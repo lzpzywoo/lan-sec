@@ -15,6 +15,7 @@ use crate::packet::{
 const RELIABLE_WINDOW: u32 = 1024;
 const RETRANSMIT: Duration = Duration::from_millis(8);
 const VIDEO_ASSEMBLE_TTL: Duration = Duration::from_millis(80);
+const CHANNELS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct BudConfig {
@@ -54,15 +55,17 @@ struct State {
     established: bool,
     send_seq: u32,
     crypto_nonce: u64,
-    reliable_next: u32,
-    reliable_out: BTreeMap<u32, Outgoing>,
-    reliable_in_next: u32,
-    reliable_hold: BTreeMap<u32, (Channel, Vec<u8>)>,
+    reliable_next: [u32; CHANNELS],
+    reliable_out: BTreeMap<(u8, u32), Outgoing>,
+    reliable_in_next: [u32; CHANNELS],
+    reliable_hold: BTreeMap<(u8, u32), Vec<u8>>,
     acked: u32,
     video: HashMap<u32, VideoFrameBuf>,
     last_video_frame: u32,
     sent_packets: u32,
     lost_packets: u32,
+    epoch: u8,
+    decrypt_fails: u32,
 }
 
 pub struct BudEndpoint {
@@ -87,15 +90,17 @@ impl BudEndpoint {
                 established: false,
                 send_seq: 1,
                 crypto_nonce: if is_host { 1 } else { 1u64 << 63 },
-                reliable_next: 1,
+                reliable_next: [1; CHANNELS],
                 reliable_out: BTreeMap::new(),
-                reliable_in_next: 1,
+                reliable_in_next: [1; CHANNELS],
                 reliable_hold: BTreeMap::new(),
                 acked: 0,
                 video: HashMap::new(),
                 last_video_frame: 0,
                 sent_packets: 0,
                 lost_packets: 0,
+                epoch: 0,
+                decrypt_fails: 0,
             }),
             congestion: Mutex::new(CongestionController::lan_default()),
         })
@@ -124,6 +129,7 @@ impl BudEndpoint {
             },
             channel: Channel::Control,
             flags: 0,
+            epoch: st.epoch,
             seq: 0,
             frame_id: 0,
             frag_idx: 0,
@@ -178,8 +184,9 @@ impl BudEndpoint {
                 .clone()
                 .ok_or_else(|| std::io::Error::other("not established"))?;
             let seq = if reliable {
-                let s = st.reliable_next;
-                st.reliable_next = st.reliable_next.wrapping_add(1);
+                let i = channel.idx();
+                let s = st.reliable_next[i];
+                st.reliable_next[i] = st.reliable_next[i].wrapping_add(1);
                 s
             } else {
                 let s = st.send_seq;
@@ -190,6 +197,7 @@ impl BudEndpoint {
                 ty: PacketType::Data,
                 channel,
                 flags,
+                epoch: st.epoch,
                 seq,
                 frame_id,
                 frag_idx,
@@ -208,7 +216,7 @@ impl BudEndpoint {
             if reliable {
                 let now = Instant::now();
                 st.reliable_out.insert(
-                    seq,
+                    (channel as u8, seq),
                     Outgoing {
                         header,
                         payload: packet.clone(),
@@ -245,7 +253,7 @@ impl BudEndpoint {
             return Ok(());
         };
         match hdr.ty {
-            PacketType::Hello | PacketType::HelloAck => self.on_hello(buf, from, hdr.ty, out),
+            PacketType::Hello | PacketType::HelloAck => self.on_hello(buf, from, hdr, out),
             PacketType::Ack => {
                 self.on_ack(buf);
                 Ok(())
@@ -258,11 +266,27 @@ impl BudEndpoint {
         }
     }
 
+    fn reset_transport(st: &mut State, is_host: bool) {
+        st.reliable_out.clear();
+        st.reliable_hold.clear();
+        st.video.clear();
+        st.send_seq = 1;
+        st.reliable_next = [1; CHANNELS];
+        st.reliable_in_next = [1; CHANNELS];
+        st.acked = 0;
+        st.last_video_frame = 0;
+        st.sent_packets = 0;
+        st.lost_packets = 0;
+        st.crypto_nonce = if is_host { 1 } else { 1u64 << 63 };
+        st.decrypt_fails = 0;
+        st.keys = None;
+    }
+
     fn on_hello(
         &self,
         buf: &[u8],
         from: SocketAddr,
-        ty: PacketType,
+        hdr: PacketHeader,
         out: &mut Vec<Incoming>,
     ) -> std::io::Result<()> {
         if buf.len() < HEADER_LEN + 32 + 16 {
@@ -273,19 +297,31 @@ impl BudEndpoint {
         let mut nonce = [0u8; 16];
         nonce.copy_from_slice(&buf[HEADER_LEN + 32..HEADER_LEN + 48]);
         let peer_public = x25519_dalek::PublicKey::from(pk);
-        let just_established = {
+        let fire_established = {
             let mut st = self.inner.lock();
-            st.peer = Some(from);
-            let keys = st.handshake.derive(&peer_public, &nonce, &self.cfg.pin);
-            st.keys = Some(keys);
             let was = st.established;
+            if matches!(hdr.ty, PacketType::Hello) && self.cfg.is_host {
+                // New client (or reconnect): drop in-flight packets encrypted under the old key.
+                st.handshake = Handshake::new();
+                st.epoch = st.epoch.wrapping_add(1);
+                if st.epoch == 0 {
+                    st.epoch = 1;
+                }
+                Self::reset_transport(&mut st, true);
+            } else if matches!(hdr.ty, PacketType::HelloAck) {
+                st.epoch = if hdr.epoch == 0 { 1 } else { hdr.epoch };
+                Self::reset_transport(&mut st, false);
+            }
+            st.peer = Some(from);
+            st.keys = Some(st.handshake.derive(&peer_public, &nonce, &self.cfg.pin));
             st.established = true;
-            !was
+            matches!(hdr.ty, PacketType::Hello) || !was
         };
-        if matches!(ty, PacketType::Hello) && self.cfg.is_host {
+        if matches!(hdr.ty, PacketType::Hello) && self.cfg.is_host {
+            *self.congestion.lock() = CongestionController::lan_default();
             self.send_hello(from)?;
         }
-        if just_established {
+        if fire_established {
             out.push(Incoming::Established { peer: from });
         }
         Ok(())
@@ -304,21 +340,28 @@ impl BudEndpoint {
         let nonce = u64::from_le_bytes(buf[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap());
         let ct = &buf[HEADER_LEN + 8..];
         let plain = {
-            let st = self.inner.lock();
-            let Some(keys) = st.keys.as_ref() else {
+            let mut st = self.inner.lock();
+            if st.epoch != 0 && hdr.epoch != 0 && hdr.epoch != st.epoch {
+                // Previous session still in the network / retransmit queue.
+                return Ok(());
+            }
+            let Some(keys) = st.keys.clone() else {
                 return Ok(());
             };
             match keys.open(nonce, &buf[..HEADER_LEN], ct) {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!("decrypt failed seq={}", hdr.seq);
+                    st.decrypt_fails = st.decrypt_fails.saturating_add(1);
+                    if st.decrypt_fails == 1 || st.decrypt_fails % 64 == 0 {
+                        warn!(fails = st.decrypt_fails, seq = hdr.seq, epoch = hdr.epoch, "decrypt failed");
+                    }
                     return Ok(());
                 }
             }
         };
         if hdr.channel == Channel::Video {
             if hdr.flags & FLAG_RELIABLE != 0 {
-                self.send_ack(from, hdr.seq)?;
+                self.send_ack(from, hdr.channel, hdr.seq)?;
             }
             let assembled = {
                 let mut st = self.inner.lock();
@@ -361,28 +404,30 @@ impl BudEndpoint {
         }
 
         if hdr.flags & FLAG_RELIABLE != 0 {
-            self.send_ack(from, hdr.seq)?;
+            self.send_ack(from, hdr.channel, hdr.seq)?;
+            let ch = hdr.channel as u8;
+            let i = hdr.channel.idx();
             let ready = {
                 let mut st = self.inner.lock();
-                if hdr.seq < st.reliable_in_next {
+                if hdr.seq < st.reliable_in_next[i] {
                     Vec::new()
                 } else {
-                    st.reliable_hold.insert(hdr.seq, (hdr.channel, plain));
+                    st.reliable_hold.insert((ch, hdr.seq), plain);
                     let mut ready = Vec::new();
                     loop {
-                        let next = st.reliable_in_next;
-                        let Some(item) = st.reliable_hold.remove(&next) else {
+                        let next = st.reliable_in_next[i];
+                        let Some(payload) = st.reliable_hold.remove(&(ch, next)) else {
                             break;
                         };
-                        ready.push(item);
-                        st.reliable_in_next = st.reliable_in_next.wrapping_add(1);
+                        ready.push(payload);
+                        st.reliable_in_next[i] = st.reliable_in_next[i].wrapping_add(1);
                     }
                     ready
                 }
             };
-            for (ch, payload) in ready {
+            for payload in ready {
                 out.push(Incoming::Datagram {
-                    channel: ch,
+                    channel: hdr.channel,
                     payload,
                     frame_id: hdr.frame_id,
                     keyframe: hdr.flags & FLAG_KEYFRAME != 0,
@@ -400,11 +445,12 @@ impl BudEndpoint {
         Ok(())
     }
 
-    fn send_ack(&self, peer: SocketAddr, seq: u32) -> std::io::Result<()> {
+    fn send_ack(&self, peer: SocketAddr, channel: Channel, seq: u32) -> std::io::Result<()> {
         let hdr = PacketHeader {
             ty: PacketType::Ack,
-            channel: Channel::Control,
+            channel,
             flags: 0,
+            epoch: 0,
             seq,
             frame_id: 0,
             frag_idx: 0,
@@ -433,7 +479,9 @@ impl BudEndpoint {
         let rtt = {
             let mut st = self.inner.lock();
             st.acked = st.acked.max(hdr.seq);
-            st.reliable_out.remove(&hdr.seq).map(|pkt| pkt.first_send.elapsed().as_micros() as u32)
+            st.reliable_out
+                .remove(&(hdr.channel as u8, hdr.seq))
+                .map(|pkt| pkt.first_send.elapsed().as_micros() as u32)
         };
         if let Some(rtt) = rtt {
             self.congestion.lock().on_rtt_sample(rtt);
@@ -447,7 +495,7 @@ impl BudEndpoint {
         let mut st = self.inner.lock();
         st.lost_packets += 1;
         if hdr.flags & FLAG_KEYFRAME != 0 {
-            if let Some(pkt) = st.reliable_out.get(&hdr.seq) {
+            if let Some(pkt) = st.reliable_out.get(&(hdr.channel as u8, hdr.seq)) {
                 let _ = pkt;
             }
         } else {
@@ -596,5 +644,111 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got);
+    }
+
+    #[test]
+    fn reconnect_replaces_session_keys() {
+        let (host, client1) = loopback_pair();
+        let host_addr: SocketAddr = host.local_addr().unwrap();
+        client1.connect(host_addr).unwrap();
+        let mut hin = Vec::new();
+        let mut cin = Vec::new();
+        for _ in 0..20 {
+            host.poll(&mut hin).unwrap();
+            client1.poll(&mut cin).unwrap();
+            if host.is_established() && client1.is_established() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(host.is_established() && client1.is_established());
+        host.send(Channel::Control, b"stale-reliable", 0, true).unwrap();
+        host.poll(&mut hin).unwrap();
+
+        let client2 = BudEndpoint::bind(BudConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            pin: "4242".into(),
+            is_host: false,
+        })
+        .unwrap();
+        client2.connect(host_addr).unwrap();
+        let mut c2 = Vec::new();
+        hin.clear();
+        for _ in 0..30 {
+            host.poll(&mut hin).unwrap();
+            client2.poll(&mut c2).unwrap();
+            if client2.is_established()
+                && hin
+                    .iter()
+                    .any(|m| matches!(m, Incoming::Established { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(client2.is_established());
+        assert!(hin.iter().any(|m| matches!(m, Incoming::Established { .. })));
+
+        let payload = vec![9u8; 800];
+        host.send(Channel::Video, &payload, 9, true).unwrap();
+        let mut got = None;
+        for _ in 0..40 {
+            host.poll(&mut hin).unwrap();
+            client2.poll(&mut c2).unwrap();
+            if let Some(Incoming::Datagram { payload: p, .. }) = c2
+                .iter()
+                .find(|m| matches!(m, Incoming::Datagram { channel: Channel::Video, .. }))
+            {
+                got = Some(p.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn control_not_blocked_by_reliable_video() {
+        let (host, client) = loopback_pair();
+        client.connect(host.local_addr().unwrap()).unwrap();
+        let mut hin = Vec::new();
+        let mut cin = Vec::new();
+        for _ in 0..20 {
+            host.poll(&mut hin).unwrap();
+            client.poll(&mut cin).unwrap();
+            if host.is_established() && client.is_established() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        host.send(Channel::Control, b"caps-a", 0, true).unwrap();
+        host.send(Channel::Video, &vec![1u8; 4000], 1, true).unwrap();
+        host.send(Channel::Control, b"caps-b", 0, true).unwrap();
+        let mut got_a = false;
+        let mut got_b = false;
+        for _ in 0..50 {
+            host.poll(&mut hin).unwrap();
+            client.poll(&mut cin).unwrap();
+            for m in &cin {
+                if let Incoming::Datagram {
+                    channel: Channel::Control,
+                    payload,
+                    ..
+                } = m
+                {
+                    if payload == b"caps-a" {
+                        got_a = true;
+                    }
+                    if payload == b"caps-b" {
+                        got_b = true;
+                    }
+                }
+            }
+            if got_a && got_b {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_a && got_b, "control after reliable keyframe must still be delivered");
     }
 }

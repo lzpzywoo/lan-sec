@@ -43,6 +43,9 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 Incoming::Established { peer } => {
                     info!(%peer, "BUD handshake complete");
                     established = true;
+                    format = None;
+                    encoder = None;
+                    force_idr = true;
                     let bytes = encode(&ControlMsg::CapsOffer(local.clone()))?;
                     bud.send(Channel::Control, &bytes, 0, true)?;
                 }
@@ -88,14 +91,13 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
         }
         if established {
             if encoder.is_none() {
-                if let Some(cap) = capture.as_ref() {
+                if let (Some(cap), Some(fmt)) = (capture.as_ref(), format) {
                     let (w, h) = cap.size();
-                    let prefer_444 = format.map(|f| f.chroma == Chroma::Yuv444).unwrap_or(true);
                     let cfg = EncoderConfig {
                         width: w,
                         height: h,
                         bitrate_bps: bud.congestion.lock().target_bps,
-                        prefer_444,
+                        prefer_444: fmt.chroma == Chroma::Yuv444,
                     };
                     #[cfg(windows)]
                     {

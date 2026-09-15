@@ -11,8 +11,9 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassExW, ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, SW_SHOW,
-    WINDOW_EX_STYLE, WM_DESTROY, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, PostQuitMessage, RegisterClassExW,
+    SetWindowDisplayAffinity, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, PM_REMOVE, SW_SHOW,
+    WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WM_DESTROY, WM_QUIT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, MSG,
 };
 
 use crate::PresentError;
@@ -20,11 +21,14 @@ use crate::PresentError;
 pub struct Swapchain {
     swap: IDXGISwapChain1,
     ctx: ID3D11DeviceContext,
+    pub width: u32,
+    pub height: u32,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_DESTROY {
+            PostQuitMessage(0);
             return LRESULT(0);
         }
         DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -62,8 +66,40 @@ impl Swapchain {
                 None,
             )
             .map_err(|e| PresentError::Message(e.to_string()))?;
+            // Must run before ShowWindow so DXGI Desktop Duplication never sees this viewer.
+            Self::exclude_from_capture(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOW);
             Ok(hwnd)
+        }
+    }
+
+    /// Keep the present window out of DXGI/WGC capture (same-machine loopback / host+client).
+    pub fn exclude_from_capture(hwnd: HWND) {
+        unsafe {
+            if let Err(e) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+                tracing::warn!("SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) failed: {e}");
+            }
+        }
+    }
+
+    /// Drain this thread's Win32 queue. Returns false after WM_QUIT (user closed the window).
+    pub fn pump_thread_messages() -> bool {
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return false;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        true
+    }
+
+    pub fn destroy_window(hwnd: HWND) {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
         }
     }
 
@@ -96,7 +132,7 @@ impl Swapchain {
             let swap = factory
                 .CreateSwapChainForHwnd(device, hwnd, &desc, None, None)
                 .map_err(|e| PresentError::Message(e.to_string()))?;
-            Ok(Self { swap, ctx })
+            Ok(Self { swap, ctx, width, height })
         }
     }
 

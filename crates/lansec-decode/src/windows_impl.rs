@@ -38,25 +38,17 @@ pub fn probe() -> Vec<CodecCap> {
         info!("Media Foundation HEVC decoder MFT registered");
     } else {
         warn!("HEVC decoder MFT not registered; install HEVC Video Extensions for Windows client decode");
+        return Vec::new();
     }
-    let mut out = vec![
-        CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160),
-        CodecCap::decode(DecodeBackend::Nvdec, Chroma::Yuv420, 3840, 2160),
-    ];
-    if let Ok(gpu) = GpuContext::new() {
-        if matches!(
-            gpu.vendor,
-            lansec_capture::GpuVendor::Nvidia | lansec_capture::GpuVendor::Intel
-        ) {
-            out.insert(
-                0,
-                CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv444, 3840, 2160),
-            );
-            out.insert(
-                1,
-                CodecCap::decode(DecodeBackend::Nvdec, Chroma::Yuv444, 3840, 2160),
-            );
-        }
+    let yuv444 = unsafe { hevc_decoder_ayuv() };
+    if yuv444 {
+        info!("MF HEVC decoder lists AYUV (4:4:4)");
+    } else {
+        info!("MF HEVC decoder: 4:2:0 only (no AYUV output type)");
+    }
+    let mut out = vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)];
+    if yuv444 {
+        out.insert(0, CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv444, 3840, 2160));
     }
     out
 }
@@ -65,6 +57,30 @@ unsafe fn hevc_decoder_available() -> bool {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     find_hevc_mft().is_ok()
+}
+
+unsafe fn hevc_decoder_ayuv() -> bool {
+    let Ok(transform) = find_hevc_mft() else {
+        return false;
+    };
+    let input = match MFCreateMediaType() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let _ = input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    let _ = input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC);
+    if transform.SetInputType(0, &input, 0).is_err() {
+        return false;
+    }
+    for i in 0..32u32 {
+        let Ok(ty) = transform.GetOutputAvailableType(0, i) else {
+            break;
+        };
+        if ty.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default() == MFVideoFormat_AYUV {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn open(chroma: Chroma, width: u32, height: u32) -> Result<Box<dyn HardwareDecoder>> {

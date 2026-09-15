@@ -43,6 +43,10 @@ impl Channel {
     pub fn is_reliable(self) -> bool {
         matches!(self, Self::Control | Self::Input)
     }
+
+    pub fn idx(self) -> usize {
+        self as u8 as usize
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
