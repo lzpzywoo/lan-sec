@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <mach/mach_time.h>
 
 #ifndef kVTProfileLevel_HEVC_Main444_AutoLevel
@@ -34,6 +35,7 @@ typedef struct {
     uint8_t *sps; size_t sps_len;
     uint8_t *pps; size_t pps_len;
     int yuv444;
+    int64_t pts;
 } VtDec;
 
 @interface LansecSckSink : NSObject <SCStreamOutput, SCStreamDelegate>
@@ -253,9 +255,12 @@ int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *
 static void on_decoded(void *decompressionOutputRefCon, void *sourceFrameRefCon, OSStatus status,
                        VTDecodeInfoFlags infoFlags, CVImageBufferRef imageBuffer, CMTime presentationTimeStamp,
                        CMTime presentationDuration) {
-    (void)sourceFrameRefCon; (void)infoFlags; (void)presentationTimeStamp; (void)presentationDuration;
+    (void)sourceFrameRefCon; (void)presentationTimeStamp; (void)presentationDuration;
     VtDec *d = (VtDec *)decompressionOutputRefCon;
-    if (status != noErr || !imageBuffer) return;
+    if (status != noErr || !imageBuffer) {
+        fprintf(stderr, "vt-dec: callback status=%d flags=%u image=%p\n", (int)status, (unsigned)infoFlags, imageBuffer);
+        return;
+    }
     CVPixelBufferRef pb = (CVPixelBufferRef)imageBuffer;
     CVPixelBufferRetain(pb);
     if (d->last) CVPixelBufferRelease(d->last);
@@ -337,13 +342,21 @@ static int annexb_to_avcc(const uint8_t *data, int len, uint8_t **out, int *out_
 
 static int ensure_vt_dec(VtDec *d, int yuv444) {
     if (d->session) return 1;
-    if (!d->vps || !d->sps || !d->pps) return 0;
+    if (!d->vps || !d->sps || !d->pps) {
+        fprintf(stderr, "vt-dec: missing parameter sets vps=%zu sps=%zu pps=%zu\n", d->vps_len, d->sps_len, d->pps_len);
+        return 0;
+    }
     const uint8_t *sets[3] = { d->vps, d->sps, d->pps };
     size_t sizes[3] = { d->vps_len, d->sps_len, d->pps_len };
     CMVideoFormatDescriptionRef fmt = NULL;
-    if (CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, 3, sets, sizes, 4, NULL, &fmt) != noErr) return 0;
+    OSStatus ps = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, 3, sets, sizes, 4, NULL, &fmt);
+    if (ps != noErr || !fmt) {
+        fprintf(stderr, "vt-dec: CreateFromHEVCParameterSets status=%d vps=%zu sps=%zu pps=%zu\n", (int)ps, d->vps_len, d->sps_len, d->pps_len);
+        return 0;
+    }
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    int32_t pf = yuv444 ? kCVPixelFormatType_444YpCbCr8 : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    // Apple HEVC 4:4:4 decode rejects packed 444YpCbCr8; BGRA is the working hardware path.
+    int32_t pf = yuv444 ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     CFNumberRef pix = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf);
     CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pix);
     CFRelease(pix);
@@ -352,10 +365,16 @@ static int ensure_vt_dec(VtDec *d, int yuv444) {
     OSStatus st = VTDecompressionSessionCreate(kCFAllocatorDefault, fmt, NULL, attrs, &cb, &d->session);
     CFRelease(attrs);
     if (st != noErr) {
+        fprintf(stderr, "vt-dec: VTDecompressionSessionCreate status=%d yuv444=%d, retry with default attrs\n", (int)st, yuv444);
+        st = VTDecompressionSessionCreate(kCFAllocatorDefault, fmt, NULL, NULL, &cb, &d->session);
+    }
+    if (st != noErr || !d->session) {
+        fprintf(stderr, "vt-dec: VTDecompressionSessionCreate failed status=%d\n", (int)st);
         CFRelease(fmt);
         return 0;
     }
     d->format = fmt;
+    fprintf(stderr, "vt-dec: session ready yuv444=%d\n", yuv444);
     return 1;
 }
 
@@ -392,14 +411,24 @@ int lansec_vt_dec_decode(void *session, const uint8_t *data, int len, void **pix
         return 0;
     }
     CMSampleBufferRef sb = NULL;
-    CMSampleTimingInfo timing = {kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid};
-    CMSampleBufferCreateReady(kCFAllocatorDefault, bb, d->format, 1, 1, &timing, 1, (size_t[]){(size_t)avcc_len}, &sb);
+    d->pts += 1;
+    CMSampleTimingInfo timing = {CMTimeMake(1, 60), CMTimeMake((int64_t)d->pts, 60), kCMTimeInvalid};
+    OSStatus sb_st = CMSampleBufferCreateReady(kCFAllocatorDefault, bb, d->format, 1, 1, &timing, 1, (size_t[]){(size_t)avcc_len}, &sb);
     CFRelease(bb);
-    if (!sb) return 0;
-    VTDecompressionSessionDecodeFrame(d->session, sb, kVTDecodeFrame_EnableAsynchronousDecompression, NULL, NULL);
+    if (sb_st != noErr || !sb) {
+        fprintf(stderr, "vt-dec: CMSampleBufferCreateReady status=%d\n", (int)sb_st);
+        return 0;
+    }
+    OSStatus dec_st = VTDecompressionSessionDecodeFrame(d->session, sb, 0, NULL, NULL);
+    if (dec_st != noErr) {
+        fprintf(stderr, "vt-dec: DecodeFrame status=%d avcc_len=%d\n", (int)dec_st, avcc_len);
+    }
     VTDecompressionSessionWaitForAsynchronousFrames(d->session);
     CFRelease(sb);
-    if (!d->last) return 0;
+    if (!d->last) {
+        fprintf(stderr, "vt-dec: no output frame after decode status=%d\n", (int)dec_st);
+        return 0;
+    }
     *pixel_buffer = d->last;
     CVPixelBufferRetain(d->last);
     return 1;
