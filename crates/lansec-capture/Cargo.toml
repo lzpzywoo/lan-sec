@@ -1,0 +1,17 @@
+[package]
+name = "lansec-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy desktop capture (DXGI / ScreenCaptureKit)"
+
+[dependencies]
+lansec-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[build-dependencies]
+cc = "1"

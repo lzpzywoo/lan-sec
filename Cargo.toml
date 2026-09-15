@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/lansec",
+    "crates/lansec-protocol",
+    "crates/lansec-bud",
+    "crates/lansec-capture",
+    "crates/lansec-encode",
+    "crates/lansec-decode",
+    "crates/lansec-present",
+    "crates/lansec-input",
+    "crates/lansec-audio",
+    "crates/lansec-session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+lansec-protocol = { path = "crates/lansec-protocol" }
+lansec-bud = { path = "crates/lansec-bud" }
+lansec-capture = { path = "crates/lansec-capture" }
+lansec-encode = { path = "crates/lansec-encode" }
+lansec-decode = { path = "crates/lansec-decode" }
+lansec-present = { path = "crates/lansec-present" }
+lansec-input = { path = "crates/lansec-input" }
+lansec-audio = { path = "crates/lansec-audio" }
+lansec-session = { path = "crates/lansec-session" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+bytes = "1"
+parking_lot = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+opus-rs = "0.1"
+cpal = "0.16"
+winit = "0.30"
+raw-window-handle = "0.6"
+libloading = "0.8"
+bytemuck = { version = "1", features = ["derive"] }
+
+[workspace.dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
+]

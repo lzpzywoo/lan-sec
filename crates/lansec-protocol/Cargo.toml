@@ -1,0 +1,12 @@
+[package]
+name = "lansec-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wire types, capability negotiation, and frame timestamps"
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true

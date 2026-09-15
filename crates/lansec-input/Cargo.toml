@@ -1,0 +1,17 @@
+[package]
+name = "lansec-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keyboard/mouse capture and injection"
+
+[dependencies]
+lansec-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lansec-capture.workspace = true

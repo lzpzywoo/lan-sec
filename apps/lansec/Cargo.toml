@@ -1,0 +1,18 @@
+[package]
+name = "lansec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LAN remote desktop CLI (Windows ↔ macOS)"
+
+[[bin]]
+name = "lansec"
+path = "src/main.rs"
+
+[dependencies]
+lansec-session.workspace = true
+lansec-bud.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "lansec-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host/client session: capture-encode-BUD-decode-present"
+
+[dependencies]
+lansec-protocol.workspace = true
+lansec-bud.workspace = true
+lansec-capture.workspace = true
+lansec-encode.workspace = true
+lansec-decode.workspace = true
+lansec-present.workspace = true
+lansec-input.workspace = true
+lansec-audio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

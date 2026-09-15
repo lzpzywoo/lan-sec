@@ -1,0 +1,16 @@
+[package]
+name = "lansec-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "System audio capture/playback with Opus"
+
+[dependencies]
+lansec-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+opus-rs.workspace = true
+cpal.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
