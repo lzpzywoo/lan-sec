@@ -21,7 +21,7 @@ lansec loopback
 
 | Role | Capture | Encode | Decode | Present | Input | Audio |
 | --- | --- | --- | --- | --- | --- | --- |
-| Windows | DXGI Desktop Duplication (GPU `CopyResource`, no CPU readback) | NVENC HEVC 4:4:4 (ARGB in, `chromaFormatIDC=3`) then QSV probe | D3D11VA / MF HEVC | DXGI flip-sequential | `SendInput` | WASAPI loopback + Opus |
+| Windows | DXGI Desktop Duplication (GPU `CopyResource`, no CPU readback) | NVENC HEVC (ARGB in) on NVIDIA; Intel hardware HEVC MFT (QSV, typically 4:2:0) on Intel iGPU | D3D11VA / MF HEVC | DXGI flip-sequential | `SendInput` | WASAPI loopback + Opus |
 | macOS | ScreenCaptureKit IOSurface | VideoToolbox HEVC (hardware required; 4:4:4 probed, else 4:2:0) | VideoToolbox | display-link style drop-late presenter | `CGEvent` | ScreenCaptureKit audio path + Opus |
 
 ## 4:4:4

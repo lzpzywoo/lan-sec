@@ -47,9 +47,18 @@ pub fn probe() -> Vec<CodecCap> {
     }
     if let Some(gpu) = gpu.as_ref() {
         if matches!(gpu.vendor, lansec_capture::GpuVendor::Intel) {
-            info!("Intel GPU: advertising QSV HEVC (4:4:4 + 4:2:0)");
-            out.push(CodecCap::encode(EncodeBackend::Qsv, Chroma::Yuv444, 3840, 2160));
-            out.push(CodecCap::encode(EncodeBackend::Qsv, Chroma::Yuv420, 3840, 2160));
+            let intel = crate::qsv::probe();
+            if intel.hevc {
+                if intel.yuv444 {
+                    info!("Intel GPU: hardware HEVC MFT (4:4:4 + 4:2:0)");
+                    out.push(CodecCap::encode(EncodeBackend::Qsv, Chroma::Yuv444, 3840, 2160));
+                } else {
+                    info!("Intel GPU: hardware HEVC MFT (4:2:0; 4:4:4 not advertised)");
+                }
+                out.push(CodecCap::encode(EncodeBackend::Qsv, Chroma::Yuv420, 3840, 2160));
+            } else {
+                warn!("Intel GPU present but no hardware HEVC encoder MFT");
+            }
         }
     }
     out
@@ -79,7 +88,7 @@ pub fn open_with_gpu(gpu: &GpuContext, cfg: EncoderConfig) -> Result<Box<dyn Har
         warn!("NVENC open failed, trying next backend");
     }
     if matches!(gpu.vendor, lansec_capture::GpuVendor::Intel) {
-        return crate::qsv::open(cfg);
+        return crate::qsv::open(gpu, cfg);
     }
     Err(EncodeError::Unavailable)
 }
