@@ -234,7 +234,7 @@ impl ClientApp {
             self.decoder = open_decoder(chroma, width.max(1), height.max(1)).ok();
         }
         if let Some(dec) = self.decoder.as_ref() {
-            info!(backend = ?dec.backend(), width, height, "hardware decoder ready");
+            info!(backend = ?dec.backend(), ?chroma, width, height, "hardware decoder ready");
         } else {
             warn!("hardware decoder unavailable");
         }
