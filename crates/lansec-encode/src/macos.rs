@@ -48,6 +48,7 @@ pub fn open(cfg: EncoderConfig) -> Result<Box<dyn HardwareEncoder>> {
         chroma,
         width: cfg.width,
         height: cfg.height,
+        scratch: vec![0u8; 4 * 1024 * 1024],
     }))
 }
 
@@ -56,6 +57,7 @@ struct VtEncoder {
     chroma: Chroma,
     width: u32,
     height: u32,
+    scratch: Vec<u8>,
 }
 
 unsafe impl Send for VtEncoder {}
@@ -65,7 +67,9 @@ impl HardwareEncoder for VtEncoder {
         let pb = frame
             .cv_pixel_buffer()
             .ok_or_else(|| EncodeError::Message("expected CVPixelBuffer".into()))?;
-        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        if self.scratch.len() < 4 * 1024 * 1024 {
+            self.scratch.resize(4 * 1024 * 1024, 0);
+        }
         let mut len = 0i32;
         let mut key = 0i32;
         let ok = unsafe {
@@ -73,8 +77,8 @@ impl HardwareEncoder for VtEncoder {
                 self.session.0.as_ptr(),
                 pb,
                 force_idr as i32,
-                buf.as_mut_ptr(),
-                buf.len() as i32,
+                self.scratch.as_mut_ptr(),
+                self.scratch.len() as i32,
                 &mut len,
                 &mut key,
             )
@@ -82,9 +86,9 @@ impl HardwareEncoder for VtEncoder {
         if ok == 0 || len <= 0 {
             return Ok(None);
         }
-        buf.truncate(len as usize);
+        let annexb = self.scratch[..len as usize].to_vec();
         Ok(Some(EncodedAu {
-            annexb: buf,
+            annexb,
             is_keyframe: key != 0 || force_idr,
             chroma: self.chroma,
             backend: EncodeBackend::VideoToolbox,

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use lansec_audio::play::Player;
@@ -24,6 +24,9 @@ use crate::local_caps;
 
 pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
     info!(%connect, "client connecting");
+    eprintln!(
+        "client stats every 0.5s — video=HEVC Mbps  udp_rx=socket Mbps  target=setpoint  gap=max frame interval  wblock=UDP full"
+    );
     let local = local_caps();
     #[cfg(windows)]
     let gpu = lansec_capture::GpuContext::new().ok();
@@ -53,11 +56,21 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         host_w: 1920,
         host_h: 1080,
         last_cong: Instant::now(),
+        last_stats: Instant::now(),
         clock: SessionClock::new(),
         video_frames: 0,
         video_without_decoder: 0,
         decode_idle: 0,
         decode_errors: 0,
+        win_frames: 0,
+        win_video_bytes: 0,
+        win_decode_us: 0,
+        win_decode_max_us: 0,
+        win_present_us: 0,
+        win_present_max_us: 0,
+        win_pump_max_us: 0,
+        win_gap_max_us: 0,
+        last_video_at: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -80,23 +93,42 @@ struct ClientApp {
     host_w: u16,
     host_h: u16,
     last_cong: Instant,
+    last_stats: Instant,
     clock: SessionClock,
     video_frames: u64,
     video_without_decoder: u64,
     decode_idle: u64,
     decode_errors: u64,
+    win_frames: u32,
+    win_video_bytes: u64,
+    win_decode_us: u64,
+    win_decode_max_us: u64,
+    win_present_us: u64,
+    win_present_max_us: u64,
+    win_pump_max_us: u64,
+    win_gap_max_us: u64,
+    last_video_at: Option<Instant>,
 }
 
 impl ClientApp {
     fn send_input(&self, ev: &InputEvent) {
         if let Ok(bytes) = encode(ev) {
-            let _ = self.bud.send(Channel::Input, &bytes, 0, false);
+            // Absolute mouse must not use the reliable window. A single lost
+            // move would hold every later click until retransmission — that is
+            // the main reason LAN input feels slower than Parsec.
+            let reliable = !matches!(
+                ev,
+                InputEvent::MouseMoveAbs { .. } | InputEvent::MouseMoveRel { .. }
+            );
+            let _ = self.bud.send_with(Channel::Input, &bytes, 0, false, reliable);
         }
     }
 
     fn pump(&mut self) {
+        let t0 = Instant::now();
         let mut incoming = Vec::new();
         if self.bud.poll(&mut incoming).is_err() {
+            self.win_pump_max_us = self.win_pump_max_us.max(t0.elapsed().as_micros() as u64);
             return;
         }
         for msg in incoming {
@@ -163,6 +195,7 @@ impl ClientApp {
                 Incoming::Datagram { .. } => {}
             }
         }
+        self.win_pump_max_us = self.win_pump_max_us.max(t0.elapsed().as_micros() as u64);
     }
 
     fn open_decoder(&mut self, chroma: lansec_protocol::Chroma, width: u32, height: u32) {
@@ -211,6 +244,13 @@ impl ClientApp {
             au.times.encode_done_us = (au.times.encode_done_us as i64 + offset).max(0) as u64;
             au.times.send_us = mapped_send;
         }
+        let now = Instant::now();
+        if let Some(prev) = self.last_video_at {
+            self.win_gap_max_us = self.win_gap_max_us.max(prev.elapsed().as_micros() as u64);
+        }
+        self.last_video_at = Some(now);
+        self.win_frames += 1;
+        self.win_video_bytes += au.annexb.len() as u64;
         au.times.recv_us = recv;
         if self.decoder.is_none() {
             self.video_without_decoder += 1;
@@ -232,14 +272,22 @@ impl ClientApp {
             }
         }
         if let Some(dec) = self.decoder.as_mut() {
+            let t_dec = Instant::now();
             match dec.decode(&au.annexb, au.is_keyframe) {
                 Ok(Some(frame)) => {
+                    let decode_us = t_dec.elapsed().as_micros() as u64;
+                    self.win_decode_us += decode_us;
+                    self.win_decode_max_us = self.win_decode_max_us.max(decode_us);
                     self.decode_idle = 0;
                     self.decode_errors = 0;
                     au.times.decode_done_us = self.clock.now_us();
                     self.presenter.submit(frame, au.times);
                     if let Some(frame) = self.presenter.take() {
+                        let t_present = Instant::now();
                         self.present_frame(frame);
+                        let present_us = t_present.elapsed().as_micros() as u64;
+                        self.win_present_us += present_us;
+                        self.win_present_max_us = self.win_present_max_us.max(present_us);
                     }
                 }
                 Ok(None) => {
@@ -267,20 +315,67 @@ impl ClientApp {
             if let Ok(report) = encode(&ControlMsg::Congestion(self.bud.congestion.lock().report())) {
                 let _ = self.bud.send(Channel::Control, &report, 0, true);
             }
-            let t = self.presenter.last_times();
-            if self.video_frames % 120 == 1 {
-                eprintln!(
-                    "timing capture→encode {:.1}ms net {:.1}ms decode {:.1}ms glass {:.1}ms presented {} dropped {} {} Mbps",
-                    t.capture_to_encode_ms(),
-                    t.net_ms(),
-                    t.decode_ms(),
-                    t.glass_ms(),
-                    self.presenter.stats().presented,
-                    self.presenter.stats().dropped,
-                    self.bud.congestion.lock().target_bps as f32 / 1_000_000.0
-                );
-            }
         }
+    }
+
+    fn maybe_log_stats(&mut self) {
+        if self.last_stats.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        let dt = self.last_stats.elapsed().as_secs_f32().max(0.001);
+        let fps = self.win_frames as f32 / dt;
+        let video_mbps = self.win_video_bytes as f32 * 8.0 / dt / 1_000_000.0;
+        let dec_avg = if self.win_frames > 0 {
+            self.win_decode_us as f32 / self.win_frames as f32 / 1000.0
+        } else {
+            0.0
+        };
+        let present_avg = if self.win_frames > 0 {
+            self.win_present_us as f32 / self.win_frames as f32 / 1000.0
+        } else {
+            0.0
+        };
+        let gap_ms = if self.win_frames == 0 {
+            self.last_video_at
+                .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+                .unwrap_or(0.0)
+        } else {
+            self.win_gap_max_us as f32 / 1000.0
+        };
+        let t = self.presenter.last_times();
+        let link = self.bud.snapshot_link();
+        eprintln!(
+            "client {:.2}s fps={:.1} video={:.1}Mbps udp_rx={:.1}Mbps target={:.1}Mbps enc={:.1}ms net={:.1}ms decode={:.1}/{:.1}ms present={:.1}/{:.1}ms glass={:.1}ms gap={:.0}ms pump={:.1}ms drop={} rtt={:.1}ms loss={:.2}% wblock={} rel={} vbuf={}",
+            dt,
+            fps,
+            video_mbps,
+            link.recv_mbps,
+            link.target_mbps,
+            t.capture_to_encode_ms(),
+            t.net_ms(),
+            dec_avg,
+            self.win_decode_max_us as f32 / 1000.0,
+            present_avg,
+            self.win_present_max_us as f32 / 1000.0,
+            t.glass_ms(),
+            gap_ms,
+            self.win_pump_max_us as f32 / 1000.0,
+            self.presenter.stats().dropped,
+            link.rtt_us as f32 / 1000.0,
+            link.loss_ppm as f32 / 10_000.0,
+            link.would_block,
+            link.reliable_out,
+            link.video_partial,
+        );
+        self.last_stats = Instant::now();
+        self.win_frames = 0;
+        self.win_video_bytes = 0;
+        self.win_decode_us = 0;
+        self.win_decode_max_us = 0;
+        self.win_present_us = 0;
+        self.win_present_max_us = 0;
+        self.win_pump_max_us = 0;
+        self.win_gap_max_us = 0;
     }
 
     fn present_frame(&mut self, frame: lansec_decode::DecodedFrame) {
@@ -342,7 +437,9 @@ impl ClientApp {
 impl ApplicationHandler for ClientApp {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
         event_loop.set_control_flow(ControlFlow::Poll);
-        self.pump();
+        // Do not decode/present here: winit delivers window events after
+        // new_events. Pumping video first adds a full encode/decode stall
+        // in front of every mouse packet.
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -426,6 +523,7 @@ impl ApplicationHandler for ClientApp {
         event_loop.set_control_flow(ControlFlow::Poll);
         self.ensure_present_targets();
         self.pump();
+        self.maybe_log_stats();
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }

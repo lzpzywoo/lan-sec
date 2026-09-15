@@ -19,7 +19,8 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolErro
     postcard::from_bytes(bytes).map_err(ProtocolError::Decode)
 }
 
-/// Logical BUD channels. Video/audio are unreliable; input/control are reliable.
+/// Logical BUD channels. Video/audio are unreliable. Control is reliable.
+/// Input clicks/keys are reliable; mouse moves are sent unreliable (latest-wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Channel {

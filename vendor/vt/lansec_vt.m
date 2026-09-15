@@ -18,6 +18,9 @@
 #ifndef kVTProfileLevel_HEVC_Main444_AutoLevel
 #define kVTProfileLevel_HEVC_Main444_AutoLevel CFSTR("HEVC_Main444_AutoLevel")
 #endif
+#ifndef kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality
+#define kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality CFSTR("PrioritizeEncodingSpeedOverQuality")
+#endif
 
 typedef struct {
     VTCompressionSessionRef session;
@@ -190,6 +193,11 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     if (st != noErr) { free(e); return NULL; }
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    int delay = 0;
+    CFNumberRef dly = CFNumberCreate(NULL, kCFNumberIntType, &delay);
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxFrameDelayCount, dly);
+    CFRelease(dly);
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
     CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &e->bitrate);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
@@ -242,9 +250,18 @@ int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *
         props = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         CFDictionarySetValue(props, kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue);
     }
+    // Drain leftover signals from a previous timeout BEFORE starting this
+    // frame, otherwise we consume this frame's callback and wait on nothing.
+    while (dispatch_semaphore_wait(e->sem, DISPATCH_TIME_NOW) == 0) {}
+    @synchronized (e->pending) {
+        [e->pending setLength:0];
+        e->pending_key = 0;
+    }
     OSStatus st = VTCompressionSessionEncodeFrame(e->session, (CVPixelBufferRef)pixel_buffer, pts, kCMTimeInvalid, props, NULL, NULL);
     if (props) CFRelease(props);
     if (st != noErr) return 0;
+    // Encode is typically ~8ms; the wait must outlast that. Timing out at 8ms
+    // drops the frame and makes motion feel like a low FPS stream.
     dispatch_semaphore_wait(e->sem, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC));
     @synchronized (e->pending) {
         int n = (int)e->pending.length;
@@ -463,6 +480,8 @@ void *lansec_sck_start(uint32_t *width, uint32_t *height) {
     cfg.sampleRate = 48000;
     cfg.channelCount = 2;
     cfg.minimumFrameInterval = CMTimeMake(1, 60);
+    // Valid range is 3–8. Deeper queues add capture latency when encode is slow.
+    cfg.queueDepth = 3;
     c->stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:c->sink];
     NSError *err = nil;
     [c->stream addStreamOutput:c->sink type:SCStreamOutputTypeScreen sampleHandlerQueue:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0) error:&err];

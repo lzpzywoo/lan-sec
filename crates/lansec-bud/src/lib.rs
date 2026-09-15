@@ -9,7 +9,7 @@ mod packet;
 
 pub use congestion::{CongestionController, CongestionStats};
 pub use crypto::SessionKeys;
-pub use endpoint::{BudConfig, BudEndpoint, Incoming};
+pub use endpoint::{BudConfig, BudEndpoint, Incoming, LinkSnapshot};
 pub use packet::{PacketHeader, MAX_PAYLOAD, MTU};
 
 pub const DEFAULT_PORT: u16 = 44700;

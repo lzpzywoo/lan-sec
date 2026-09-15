@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lansec_protocol::Channel;
@@ -70,11 +71,43 @@ struct State {
     last_idr_req: Option<Instant>,
 }
 
+/// UDP + queue snapshot since the previous call. Both sides print this ~2 Hz.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkSnapshot {
+    pub dt_s: f32,
+    pub send_mbps: f32,
+    pub recv_mbps: f32,
+    pub send_pps: f32,
+    pub recv_pps: f32,
+    pub would_block: u64,
+    pub reliable_out: usize,
+    pub reliable_hold: usize,
+    pub video_partial: usize,
+    pub rtt_us: u32,
+    pub loss_ppm: u32,
+    pub target_mbps: f32,
+}
+
+struct LinkMeter {
+    t0: Instant,
+    sent: u64,
+    recv: u64,
+    pkts_sent: u64,
+    pkts_recv: u64,
+    would_block: u64,
+}
+
 pub struct BudEndpoint {
     sock: UdpSocket,
     cfg: BudConfig,
     inner: Mutex<State>,
     pub congestion: Mutex<CongestionController>,
+    bytes_sent: AtomicU64,
+    bytes_recv: AtomicU64,
+    pkts_sent: AtomicU64,
+    pkts_recv: AtomicU64,
+    would_block: AtomicU64,
+    meter: Mutex<LinkMeter>,
 }
 
 impl BudEndpoint {
@@ -107,7 +140,60 @@ impl BudEndpoint {
                 last_idr_req: None,
             }),
             congestion: Mutex::new(CongestionController::lan_default()),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            pkts_sent: AtomicU64::new(0),
+            pkts_recv: AtomicU64::new(0),
+            would_block: AtomicU64::new(0),
+            meter: Mutex::new(LinkMeter {
+                t0: Instant::now(),
+                sent: 0,
+                recv: 0,
+                pkts_sent: 0,
+                pkts_recv: 0,
+                would_block: 0,
+            }),
         })
+    }
+
+    /// Bytes/packets since the last snapshot. Safe to call from one thread per endpoint.
+    pub fn snapshot_link(&self) -> LinkSnapshot {
+        fn mbps(bytes: u64, dt: f32) -> f32 {
+            bytes as f32 * 8.0 / dt / 1_000_000.0
+        }
+        let sent = self.bytes_sent.load(Ordering::Relaxed);
+        let recv = self.bytes_recv.load(Ordering::Relaxed);
+        let ps = self.pkts_sent.load(Ordering::Relaxed);
+        let pr = self.pkts_recv.load(Ordering::Relaxed);
+        let wb = self.would_block.load(Ordering::Relaxed);
+        let cong = self.congestion.lock().stats();
+        let (reliable_out, reliable_hold, video_partial) = {
+            let st = self.inner.lock();
+            (st.reliable_out.len(), st.reliable_hold.len(), st.video.len())
+        };
+        let mut meter = self.meter.lock();
+        let dt = meter.t0.elapsed().as_secs_f32().max(0.001);
+        let snap = LinkSnapshot {
+            dt_s: dt,
+            send_mbps: mbps(sent.saturating_sub(meter.sent), dt),
+            recv_mbps: mbps(recv.saturating_sub(meter.recv), dt),
+            send_pps: ps.saturating_sub(meter.pkts_sent) as f32 / dt,
+            recv_pps: pr.saturating_sub(meter.pkts_recv) as f32 / dt,
+            would_block: wb.saturating_sub(meter.would_block),
+            reliable_out,
+            reliable_hold,
+            video_partial,
+            rtt_us: cong.rtt_us,
+            loss_ppm: cong.loss_ppm,
+            target_mbps: cong.target_bps as f32 / 1_000_000.0,
+        };
+        meter.t0 = Instant::now();
+        meter.sent = sent;
+        meter.recv = recv;
+        meter.pkts_sent = ps;
+        meter.pkts_recv = pr;
+        meter.would_block = wb;
+        snap
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -143,12 +229,24 @@ impl BudEndpoint {
         buf.extend_from_slice(st.handshake.public.as_bytes());
         buf.extend_from_slice(&st.handshake.nonce);
         drop(st);
-        self.sock.send_to(&buf, peer)?;
+        self.send_udp(&buf, peer)?;
         Ok(())
     }
 
     pub fn send(&self, channel: Channel, payload: &[u8], frame_id: u32, keyframe: bool) -> std::io::Result<()> {
-        let reliable = channel.is_reliable();
+        self.send_with(channel, payload, frame_id, keyframe, channel.is_reliable())
+    }
+
+    /// Same as [`send`], but reliability is explicit. Mouse moves must be
+    /// unreliable: a lost packet must not stall later clicks behind in-order seq.
+    pub fn send_with(
+        self: &Self,
+        channel: Channel,
+        payload: &[u8],
+        frame_id: u32,
+        keyframe: bool,
+        reliable: bool,
+    ) -> std::io::Result<()> {
         let frags = fragment(payload);
         let count = frags.len() as u16;
         for (idx, _, chunk) in frags {
@@ -240,8 +338,15 @@ impl BudEndpoint {
 
     fn send_udp(&self, buf: &[u8], peer: SocketAddr) -> std::io::Result<()> {
         match self.sock.send_to(buf, peer) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Ok(n) => {
+                self.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                self.pkts_sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.would_block.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -250,7 +355,11 @@ impl BudEndpoint {
         let mut buf = [0u8; 2048];
         loop {
             match self.sock.recv_from(&mut buf) {
-                Ok((n, from)) => self.handle_datagram(&buf[..n], from, out)?,
+                Ok((n, from)) => {
+                    self.bytes_recv.fetch_add(n as u64, Ordering::Relaxed);
+                    self.pkts_recv.fetch_add(1, Ordering::Relaxed);
+                    self.handle_datagram(&buf[..n], from, out)?;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
@@ -709,6 +818,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got);
+    }
+
+    #[test]
+    fn unreliable_mouse_delivers_without_acks() {
+        let (host, client) = loopback_pair();
+        client.connect(host.local_addr().unwrap()).unwrap();
+        let mut hin = Vec::new();
+        let mut cin = Vec::new();
+        for _ in 0..20 {
+            host.poll(&mut hin).unwrap();
+            client.poll(&mut cin).unwrap();
+            if host.is_established() && client.is_established() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for i in 0..32u8 {
+            client
+                .send_with(Channel::Input, &[b'm', i], 0, false, false)
+                .unwrap();
+        }
+        let mut got = 0;
+        for _ in 0..40 {
+            host.poll(&mut hin).unwrap();
+            got = hin
+                .iter()
+                .filter(|m| matches!(m, Incoming::Datagram { channel: Channel::Input, .. }))
+                .count();
+            if got >= 32 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got >= 32, "unreliable mouse must not wait on acks, got {got}");
     }
 
     #[test]
