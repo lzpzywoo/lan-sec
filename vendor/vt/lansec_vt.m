@@ -37,7 +37,7 @@ typedef struct {
 } VtDec;
 
 @interface LansecSckSink : NSObject <SCStreamOutput, SCStreamDelegate>
-@property(atomic, strong) IOSurfaceRef surface;
+@property(atomic, assign) IOSurfaceRef surface;
 @property(atomic) uint64_t capture_us;
 @property(atomic) uint32_t width;
 @property(atomic) uint32_t height;
@@ -53,6 +53,11 @@ typedef struct {
         _audioLock = [NSLock new];
     }
     return self;
+}
+- (void)dealloc {
+    IOSurfaceRef old = _surface;
+    _surface = NULL;
+    if (old) CFRelease(old);
 }
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
     if (type == SCStreamOutputTypeAudio) {
@@ -156,8 +161,9 @@ int lansec_vt_probe_444(void) {
     CFRelease(spec);
     if (st != noErr || !s) return 0;
     OSStatus set = VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main444_AutoLevel);
-    Boolean hw = false;
+    CFBooleanRef hw = NULL;
     VTSessionCopyProperty(s, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kCFAllocatorDefault, &hw);
+    if (hw) CFRelease(hw);
     VTCompressionSessionInvalidate(s);
     CFRelease(s);
     return (set == noErr) ? 1 : 0;
