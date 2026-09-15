@@ -15,6 +15,7 @@ use crate::packet::{
 const RELIABLE_WINDOW: u32 = 1024;
 const RETRANSMIT: Duration = Duration::from_millis(8);
 const VIDEO_ASSEMBLE_TTL: Duration = Duration::from_millis(80);
+const IDR_DEBOUNCE: Duration = Duration::from_millis(250);
 const CHANNELS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ struct State {
     lost_packets: u32,
     epoch: u8,
     decrypt_fails: u32,
+    last_idr_req: Option<Instant>,
 }
 
 pub struct BudEndpoint {
@@ -79,6 +81,7 @@ impl BudEndpoint {
     pub fn bind(cfg: BudConfig) -> std::io::Result<Self> {
         let sock = UdpSocket::bind(cfg.bind)?;
         sock.set_nonblocking(true)?;
+        bump_udp_buffers(&sock);
         let is_host = cfg.is_host;
         Ok(Self {
             sock,
@@ -101,6 +104,7 @@ impl BudEndpoint {
                 lost_packets: 0,
                 epoch: 0,
                 decrypt_fails: 0,
+                last_idr_req: None,
             }),
             congestion: Mutex::new(CongestionController::lan_default()),
         })
@@ -144,7 +148,7 @@ impl BudEndpoint {
     }
 
     pub fn send(&self, channel: Channel, payload: &[u8], frame_id: u32, keyframe: bool) -> std::io::Result<()> {
-        let reliable = channel.is_reliable() || (channel == Channel::Video && keyframe);
+        let reliable = channel.is_reliable();
         let frags = fragment(payload);
         let count = frags.len() as u16;
         for (idx, _, chunk) in frags {
@@ -230,8 +234,16 @@ impl BudEndpoint {
             (header, packet)
         };
         let _ = header;
-        self.sock.send_to(&packet, peer)?;
+        self.send_udp(&packet, peer)?;
         Ok(())
+    }
+
+    fn send_udp(&self, buf: &[u8], peer: SocketAddr) -> std::io::Result<()> {
+        match self.sock.send_to(buf, peer) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn poll(&self, out: &mut Vec<Incoming>) -> std::io::Result<()> {
@@ -279,6 +291,7 @@ impl BudEndpoint {
         st.lost_packets = 0;
         st.crypto_nonce = if is_host { 1 } else { 1u64 << 63 };
         st.decrypt_fails = 0;
+        st.last_idr_req = None;
         st.keys = None;
     }
 
@@ -468,7 +481,7 @@ impl BudEndpoint {
                 }
             }
         }
-        self.sock.send_to(&buf, peer)?;
+        self.send_udp(&buf, peer)?;
         Ok(())
     }
 
@@ -489,22 +502,16 @@ impl BudEndpoint {
     }
 
     fn on_nack(&self, buf: &[u8], out: &mut Vec<Incoming>) {
-        let Some(hdr) = PacketHeader::decode(buf) else {
+        if PacketHeader::decode(buf).is_none() {
             return;
-        };
-        let mut st = self.inner.lock();
-        st.lost_packets += 1;
-        if hdr.flags & FLAG_KEYFRAME != 0 {
-            if let Some(pkt) = st.reliable_out.get(&(hdr.channel as u8, hdr.seq)) {
-                let _ = pkt;
-            }
-        } else {
-            out.push(Incoming::NeedIdr);
         }
-        let sent = st.sent_packets;
-        let lost = st.lost_packets;
-        drop(st);
+        let (sent, lost) = {
+            let mut st = self.inner.lock();
+            st.lost_packets += 1;
+            (st.sent_packets, st.lost_packets)
+        };
         self.congestion.lock().on_loss(lost, sent.max(1));
+        self.push_idr(out);
     }
 
     fn retransmit(&self) -> std::io::Result<()> {
@@ -527,7 +534,7 @@ impl BudEndpoint {
             (peer, packets)
         };
         for p in packets {
-            self.sock.send_to(&p, peer)?;
+            self.send_udp(&p, peer)?;
         }
         Ok(())
     }
@@ -541,20 +548,78 @@ impl BudEndpoint {
             .filter(|(_, b)| now.duration_since(b.first_seen) > VIDEO_ASSEMBLE_TTL)
             .map(|(id, _)| *id)
             .collect();
+        let mut need_idr = false;
         for id in expired {
-            if let Some(buf) = st.video.remove(&id) {
+            if st.video.remove(&id).is_some() {
                 st.lost_packets += 1;
-                if buf.keyframe {
-                    out.push(Incoming::NeedIdr);
-                } else {
-                    out.push(Incoming::NeedIdr);
-                }
+                need_idr = true;
             }
         }
+        drop(st);
+        if need_idr {
+            let (lost, sent) = {
+                let st = self.inner.lock();
+                (st.lost_packets, st.sent_packets)
+            };
+            self.congestion.lock().on_loss(lost, sent.max(1));
+            self.push_idr(out);
+        }
+    }
+
+    fn push_idr(&self, out: &mut Vec<Incoming>) {
+        let mut st = self.inner.lock();
+        if let Some(prev) = st.last_idr_req {
+            if prev.elapsed() < IDR_DEBOUNCE {
+                return;
+            }
+        }
+        st.last_idr_req = Some(Instant::now());
+        drop(st);
+        out.push(Incoming::NeedIdr);
     }
 
     pub fn is_established(&self) -> bool {
         self.inner.lock().established
+    }
+}
+
+fn bump_udp_buffers(sock: &UdpSocket) {
+    const BYTES: i32 = 8 * 1024 * 1024;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn setsockopt(s: usize, level: i32, name: i32, val: *const i8, len: i32) -> i32;
+        }
+        let s = sock.as_raw_socket() as usize;
+        let v = BYTES;
+        unsafe {
+            let _ = setsockopt(s, 0xffff, 0x1001, &v as *const i32 as *const i8, 4);
+            let _ = setsockopt(s, 0xffff, 0x1002, &v as *const i32 as *const i8, 4);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let v = BYTES;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &v as *const i32 as *const libc::c_void,
+                std::mem::size_of_val(&v) as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &v as *const i32 as *const libc::c_void,
+                std::mem::size_of_val(&v) as libc::socklen_t,
+            );
+        }
     }
 }
 

@@ -992,6 +992,7 @@ dependencies = [
  "aes-gcm",
  "hkdf",
  "lansec-protocol",
+ "libc",
  "parking_lot",
  "rand",
  "sha2",

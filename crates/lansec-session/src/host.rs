@@ -36,58 +36,16 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     #[cfg(windows)]
     let mut loopback = lansec_audio::wasapi::Loopback::open().ok();
     loop {
-        let mut incoming = Vec::new();
-        bud.poll(&mut incoming)?;
-        for msg in incoming {
-            match msg {
-                Incoming::Established { peer } => {
-                    info!(%peer, "BUD handshake complete");
-                    established = true;
-                    format = None;
-                    encoder = None;
-                    force_idr = true;
-                    let bytes = encode(&ControlMsg::CapsOffer(local.clone()))?;
-                    bud.send(Channel::Control, &bytes, 0, true)?;
-                }
-                Incoming::NeedIdr => force_idr = true,
-                Incoming::Datagram {
-                    channel: Channel::Control,
-                    payload,
-                    ..
-                } => match decode::<ControlMsg>(&payload)? {
-                    ControlMsg::CapsOffer(remote) => {
-                        let fmt = negotiate_with_size(&local, &remote, capture.as_ref())?;
-                        info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
-                        println!("stream format: {}", fmt.chroma_label());
-                        let bytes = encode(&ControlMsg::CapsAccept { format: fmt })?;
-                        bud.send(Channel::Control, &bytes, 0, true)?;
-                        format = Some(fmt);
-                    }
-                    ControlMsg::CapsAccept { format: fmt } => {
-                        info!(chroma = fmt.chroma_label(), "peer accepted");
-                        println!("stream format: {}", fmt.chroma_label());
-                        format = Some(fmt);
-                    }
-                    ControlMsg::RequestIdr => force_idr = true,
-                    ControlMsg::Congestion(r) => {
-                        if let Some(enc) = encoder.as_mut() {
-                            enc.set_bitrate(r.suggested_bitrate_bps);
-                            info!(bps = r.suggested_bitrate_bps, rtt_us = r.rtt_us, loss_ppm = r.loss_ppm, "bitrate from client");
-                        }
-                    }
-                    ControlMsg::Bye => return Ok(()),
-                },
-                Incoming::Datagram {
-                    channel: Channel::Input,
-                    payload,
-                    ..
-                } => {
-                    if let Ok(ev) = decode::<InputEvent>(&payload) {
-                        let _ = inject(&ev);
-                    }
-                }
-                Incoming::Datagram { .. } => {}
-            }
+        if !drain_incoming(
+            &bud,
+            &local,
+            capture.as_ref(),
+            &mut encoder,
+            &mut established,
+            &mut format,
+            &mut force_idr,
+        )? {
+            return Ok(());
         }
         if established {
             if encoder.is_none() {
@@ -154,8 +112,85 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 }
             }
         }
+        // Input must not sit behind encode: poll again before the 1ms sleep.
+        if !drain_incoming(
+            &bud,
+            &local,
+            capture.as_ref(),
+            &mut encoder,
+            &mut established,
+            &mut format,
+            &mut force_idr,
+        )? {
+            return Ok(());
+        }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn drain_incoming(
+    bud: &BudEndpoint,
+    local: &Caps,
+    capture: Option<&CaptureSession>,
+    encoder: &mut Option<Box<dyn HardwareEncoder>>,
+    established: &mut bool,
+    format: &mut Option<NegotiatedFormat>,
+    force_idr: &mut bool,
+) -> Result<bool> {
+    let mut incoming = Vec::new();
+    bud.poll(&mut incoming)?;
+    for msg in incoming {
+        match msg {
+            Incoming::Established { peer } => {
+                info!(%peer, "BUD handshake complete");
+                *established = true;
+                *format = None;
+                *encoder = None;
+                *force_idr = true;
+                let bytes = encode(&ControlMsg::CapsOffer(local.clone()))?;
+                bud.send(Channel::Control, &bytes, 0, true)?;
+            }
+            Incoming::NeedIdr => *force_idr = true,
+            Incoming::Datagram {
+                channel: Channel::Control,
+                payload,
+                ..
+            } => match decode::<ControlMsg>(&payload)? {
+                ControlMsg::CapsOffer(remote) => {
+                    let fmt = negotiate_with_size(local, &remote, capture)?;
+                    info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
+                    println!("stream format: {}", fmt.chroma_label());
+                    let bytes = encode(&ControlMsg::CapsAccept { format: fmt })?;
+                    bud.send(Channel::Control, &bytes, 0, true)?;
+                    *format = Some(fmt);
+                }
+                ControlMsg::CapsAccept { format: fmt } => {
+                    info!(chroma = fmt.chroma_label(), "peer accepted");
+                    println!("stream format: {}", fmt.chroma_label());
+                    *format = Some(fmt);
+                }
+                ControlMsg::RequestIdr => *force_idr = true,
+                ControlMsg::Congestion(r) => {
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.set_bitrate(r.suggested_bitrate_bps);
+                        info!(bps = r.suggested_bitrate_bps, rtt_us = r.rtt_us, loss_ppm = r.loss_ppm, "bitrate from client");
+                    }
+                }
+                ControlMsg::Bye => return Ok(false),
+            },
+            Incoming::Datagram {
+                channel: Channel::Input,
+                payload,
+                ..
+            } => {
+                if let Ok(ev) = decode::<InputEvent>(&payload) {
+                    let _ = inject(&ev);
+                }
+            }
+            Incoming::Datagram { .. } => {}
+        }
+    }
+    Ok(true)
 }
 
 fn negotiate_with_size(

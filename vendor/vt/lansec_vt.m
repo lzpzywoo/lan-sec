@@ -197,6 +197,10 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     CFNumberRef efps = CFNumberCreate(NULL, kCFNumberIntType, &fps);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate, efps);
     CFRelease(efps);
+    int gop = 120;
+    CFNumberRef kgop = CFNumberCreate(NULL, kCFNumberIntType, &gop);
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, kgop);
+    CFRelease(kgop);
     if (yuv444) {
         if (VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main444_AutoLevel) != noErr) {
             lansec_vt_close(e);
@@ -241,7 +245,7 @@ int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *
     OSStatus st = VTCompressionSessionEncodeFrame(e->session, (CVPixelBufferRef)pixel_buffer, pts, kCMTimeInvalid, props, NULL, NULL);
     if (props) CFRelease(props);
     if (st != noErr) return 0;
-    dispatch_semaphore_wait(e->sem, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
+    dispatch_semaphore_wait(e->sem, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC));
     @synchronized (e->pending) {
         int n = (int)e->pending.length;
         if (n > cap) n = cap;
@@ -452,7 +456,9 @@ void *lansec_sck_start(uint32_t *width, uint32_t *height) {
     cfg.width = disp.width;
     cfg.height = disp.height;
     cfg.pixelFormat = kCVPixelFormatType_32BGRA;
-    cfg.showsCursor = YES;
+    // Parsec-style: do not bake the cursor into the video. The client draws its
+    // local cursor immediately; the captured cursor would lag by one encode/decode.
+    cfg.showsCursor = NO;
     cfg.capturesAudio = YES;
     cfg.sampleRate = 48000;
     cfg.channelCount = 2;

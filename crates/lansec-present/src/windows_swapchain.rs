@@ -6,8 +6,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH,
-    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT,
+    DXGI_PRESENT_ALLOW_TEARING, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -23,6 +24,7 @@ pub struct Swapchain {
     ctx: ID3D11DeviceContext,
     pub width: u32,
     pub height: u32,
+    allow_tearing: bool,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -116,6 +118,24 @@ impl Swapchain {
             let factory: IDXGIFactory2 = adapter
                 .GetParent()
                 .map_err(|e| PresentError::Message(e.to_string()))?;
+            let mut tearing = 0i32;
+            let allow_tearing = factory
+                .cast::<IDXGIFactory5>()
+                .ok()
+                .and_then(|f5| {
+                    f5.CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        &mut tearing as *mut i32 as *mut _,
+                        std::mem::size_of::<i32>() as u32,
+                    )
+                    .ok()?;
+                    Some(tearing != 0)
+                })
+                .unwrap_or(false);
+            let mut flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32;
+            if allow_tearing {
+                flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+            }
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -127,12 +147,18 @@ impl Swapchain {
                 Scaling: Default::default(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
                 AlphaMode: Default::default(),
-                Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
+                Flags: flags,
             };
             let swap = factory
                 .CreateSwapChainForHwnd(device, hwnd, &desc, None, None)
                 .map_err(|e| PresentError::Message(e.to_string()))?;
-            Ok(Self { swap, ctx, width, height })
+            Ok(Self {
+                swap,
+                ctx,
+                width,
+                height,
+                allow_tearing,
+            })
         }
     }
 
@@ -156,8 +182,13 @@ impl Swapchain {
             let dst: ID3D11Resource = back.cast().map_err(|e| PresentError::Message(e.to_string()))?;
             let src_r: ID3D11Resource = src.cast().map_err(|e| PresentError::Message(e.to_string()))?;
             self.ctx.CopyResource(&dst, &src_r);
+            let flags = if self.allow_tearing {
+                DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                DXGI_PRESENT(0)
+            };
             self.swap
-                .Present(1, DXGI_PRESENT(0))
+                .Present(0, flags)
                 .ok()
                 .map_err(|e| PresentError::Message(e.to_string()))?;
         }

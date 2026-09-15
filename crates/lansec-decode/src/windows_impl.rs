@@ -22,10 +22,11 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncH265VProfile_Main_420_8, eAVEncH265VProfile_Main_444_8, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager,
     IMFMediaBuffer, IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
     MFCreateSample, MFTEnumEx, MFStartup, CODECAPI_AVLowLatencyMode, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video, MFVideoFormat_AYUV,
-    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_E_BUFFERTOOSMALL,
+    MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_VERSION,
 };
@@ -41,50 +42,17 @@ pub fn probe() -> Vec<CodecCap> {
         warn!("HEVC decoder MFT not registered; install HEVC Video Extensions for Windows client decode");
         return Vec::new();
     }
-    // AYUV as an output type is not HEVC Main 4:4:4. The inbox decoder lists AYUV
-    // for 4:2:0 CSC; Mac host would then send Main 4:4:4 that this MFT cannot decode.
-    let yuv444 = unsafe { hevc_decoder_main444() };
-    if yuv444 {
-        info!("MF HEVC decoder accepts Main 4:4:4 (AYUV)");
-    } else {
-        info!("MF HEVC decoder: 4:2:0 only (Main 4:4:4 profile not accepted)");
-    }
-    let mut out = vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)];
-    if yuv444 {
-        out.insert(0, CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv444, 3840, 2160));
-    }
-    out
+    // Do not advertise Main 4:4:4. Intel/Microsoft HEVC MFTs accept that profile on
+    // SetInputType and list AYUV, then fail on a real 4:4:4 bitstream (no frames,
+    // then MF_E_BUFFERTOOSMALL). True-color is Windows host → Mac client.
+    info!("MF HEVC decoder: 4:2:0 only (Main 4:4:4 not advertised on Windows)");
+    vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)]
 }
 
 unsafe fn hevc_decoder_available() -> bool {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     find_hevc_mft().is_ok()
-}
-
-unsafe fn hevc_decoder_main444() -> bool {
-    let Ok(transform) = find_hevc_mft() else {
-        return false;
-    };
-    let input = match MFCreateMediaType() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let _ = input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-    let _ = input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC);
-    let _ = input.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32);
-    if transform.SetInputType(0, &input, 0).is_err() {
-        return false;
-    }
-    for i in 0..32u32 {
-        let Ok(ty) = transform.GetOutputAvailableType(0, i) else {
-            break;
-        };
-        if ty.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default() == MFVideoFormat_AYUV {
-            return true;
-        }
-    }
-    false
 }
 
 pub fn open(chroma: Chroma, width: u32, height: u32) -> Result<Box<dyn HardwareDecoder>> {
@@ -190,7 +158,17 @@ unsafe fn open_inner(
     transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
     let provides = transform.GetOutputStreamInfo(0)?.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
-    info!(?chroma, width, height, provides, "MF HEVC decoder (D3D11) ready");
+    let mut in_info = MFT_INPUT_STREAM_INFO::default();
+    transform.GetInputStreamInfo(0, &mut in_info)?;
+    info!(
+        ?chroma,
+        width,
+        height,
+        provides,
+        input_cb = in_info.cbSize,
+        input_align = in_info.cbAlignment,
+        "MF HEVC decoder (D3D11) ready"
+    );
 
     Ok(Box::new(MfDecoder {
         width,
@@ -203,6 +181,8 @@ unsafe fn open_inner(
         _manager: manager,
         transform,
         provides_samples: provides,
+        min_input: in_info.cbSize,
+        input_align: in_info.cbAlignment,
         origin: Instant::now(),
         csc: VideoCsc::try_new(&gpu.device, &gpu.context, width, height).ok(),
         sample_clock: 0,
@@ -329,6 +309,8 @@ struct MfDecoder {
     _manager: IMFDXGIDeviceManager,
     transform: IMFTransform,
     provides_samples: bool,
+    min_input: u32,
+    input_align: u32,
     origin: Instant,
     csc: Option<VideoCsc>,
     sample_clock: i64,
@@ -351,16 +333,7 @@ impl HardwareDecoder for MfDecoder {
 
 impl MfDecoder {
     unsafe fn feed(&mut self, annexb: &[u8]) -> windows::core::Result<Option<DecodedFrame>> {
-        let sample: IMFSample = MFCreateSample()?;
-        let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(annexb.len() as u32)?;
-        let mut max = 0u32;
-        let mut current = 0u32;
-        let mut ptr = std::ptr::null_mut();
-        buffer.Lock(&mut ptr, Some(&mut max), Some(&mut current))?;
-        std::ptr::copy_nonoverlapping(annexb.as_ptr(), ptr, annexb.len());
-        buffer.Unlock()?;
-        buffer.SetCurrentLength(annexb.len() as u32)?;
-        sample.AddBuffer(&buffer)?;
+        let sample = self.make_input_sample(annexb)?;
         self.sample_clock += 10_000;
         sample.SetSampleTime(self.sample_clock)?;
         sample.SetSampleDuration(10_000)?;
@@ -368,7 +341,31 @@ impl MfDecoder {
         self.drain()
     }
 
+    /// MFT HEVC decoders rewrite Annex B in place and require GetInputStreamInfo.cbSize
+    /// (and spare tail bytes). A buffer sized exactly to the AU returns MF_E_BUFFERTOOSMALL.
+    unsafe fn make_input_sample(&self, annexb: &[u8]) -> windows::core::Result<IMFSample> {
+        let align = self.input_align.max(1);
+        let min = (annexb.len() as u32)
+            .max(self.min_input)
+            .saturating_add(1024)
+            .max(1);
+        let size = min.saturating_add(align - 1) / align * align;
+        let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(size)?;
+        let mut max = 0u32;
+        let mut current = 0u32;
+        let mut ptr = std::ptr::null_mut();
+        buffer.Lock(&mut ptr, Some(&mut max), Some(&mut current))?;
+        let copy = annexb.len().min(max as usize);
+        std::ptr::copy_nonoverlapping(annexb.as_ptr(), ptr, copy);
+        buffer.Unlock()?;
+        buffer.SetCurrentLength(copy as u32)?;
+        let sample: IMFSample = MFCreateSample()?;
+        sample.AddBuffer(&buffer)?;
+        Ok(sample)
+    }
+
     unsafe fn drain(&mut self) -> windows::core::Result<Option<DecodedFrame>> {
+        let mut too_small = 0u8;
         loop {
             let mut out = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
@@ -404,6 +401,19 @@ impl MfDecoder {
                         [MFVideoFormat_NV12, MFVideoFormat_AYUV]
                     };
                     set_output_type(&self.transform, self.width, self.height, &prefer)?;
+                    let info = self.transform.GetOutputStreamInfo(0)?;
+                    self.provides_samples =
+                        info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+                    continue;
+                }
+                Err(e) if e.code() == MF_E_BUFFERTOOSMALL => {
+                    let _ = ManuallyDrop::take(&mut out.pSample);
+                    let _ = ManuallyDrop::take(&mut out.pEvents);
+                    too_small += 1;
+                    if too_small > 4 {
+                        return Err(e);
+                    }
+                    self.provides_samples = false;
                     continue;
                 }
                 Err(e) => {
@@ -417,8 +427,9 @@ impl MfDecoder {
 
     unsafe fn make_output_sample(&self) -> windows::core::Result<IMFSample> {
         let info = self.transform.GetOutputStreamInfo(0)?;
+        let fallback = self.width.saturating_mul(self.height).saturating_mul(4);
         let sample = MFCreateSample()?;
-        let buf = MFCreateMemoryBuffer(info.cbSize.max(1))?;
+        let buf = MFCreateMemoryBuffer(info.cbSize.max(fallback).max(1))?;
         sample.AddBuffer(&buf)?;
         Ok(sample)
     }

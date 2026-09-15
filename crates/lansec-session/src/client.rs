@@ -57,6 +57,7 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         video_frames: 0,
         video_without_decoder: 0,
         decode_idle: 0,
+        decode_errors: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -83,6 +84,7 @@ struct ClientApp {
     video_frames: u64,
     video_without_decoder: u64,
     decode_idle: u64,
+    decode_errors: u64,
 }
 
 impl ClientApp {
@@ -233,6 +235,7 @@ impl ClientApp {
             match dec.decode(&au.annexb, au.is_keyframe) {
                 Ok(Some(frame)) => {
                     self.decode_idle = 0;
+                    self.decode_errors = 0;
                     au.times.decode_done_us = self.clock.now_us();
                     self.presenter.submit(frame, au.times);
                     if let Some(frame) = self.presenter.take() {
@@ -250,7 +253,12 @@ impl ClientApp {
                         );
                     }
                 }
-                Err(e) => warn!("decode: {e}"),
+                Err(e) => {
+                    self.decode_errors += 1;
+                    if self.decode_errors == 1 || self.decode_errors % 60 == 0 {
+                        warn!(n = self.decode_errors, "decode: {e}");
+                    }
+                }
             }
         }
         self.video_frames += 1;
@@ -262,13 +270,14 @@ impl ClientApp {
             let t = self.presenter.last_times();
             if self.video_frames % 120 == 1 {
                 eprintln!(
-                    "timing capture→encode {:.1}ms net {:.1}ms decode {:.1}ms glass {:.1}ms presented {} dropped {}",
+                    "timing capture→encode {:.1}ms net {:.1}ms decode {:.1}ms glass {:.1}ms presented {} dropped {} {} Mbps",
                     t.capture_to_encode_ms(),
                     t.net_ms(),
                     t.decode_ms(),
                     t.glass_ms(),
                     self.presenter.stats().presented,
-                    self.presenter.stats().dropped
+                    self.presenter.stats().dropped,
+                    self.bud.congestion.lock().target_bps as f32 / 1_000_000.0
                 );
             }
         }
@@ -355,6 +364,10 @@ impl ApplicationHandler for ClientApp {
                         lansec_present::windows_swapchain::Swapchain::exclude_from_capture(hwnd);
                     }
                     self.window = Some(w);
+                    if let Some(win) = self.window.as_ref() {
+                        // Local cursor is the interactive one; Mac capture excludes the host cursor.
+                        win.set_cursor_visible(true);
+                    }
                 }
                 Err(e) => warn!("window: {e}"),
             }
@@ -366,9 +379,23 @@ impl ApplicationHandler for ClientApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
+                let (ww, wh) = self
+                    .window
+                    .as_ref()
+                    .map(|w| {
+                        let s = w.inner_size();
+                        (s.width.max(1) as f64, s.height.max(1) as f64)
+                    })
+                    .unwrap_or((self.host_w.max(1) as f64, self.host_h.max(1) as f64));
+                let x = (position.x / ww * self.host_w as f64)
+                    .round()
+                    .clamp(0.0, u16::MAX as f64) as u16;
+                let y = (position.y / wh * self.host_h as f64)
+                    .round()
+                    .clamp(0.0, u16::MAX as f64) as u16;
                 self.send_input(&InputEvent::MouseMoveAbs {
-                    x: position.x as u16,
-                    y: position.y as u16,
+                    x,
+                    y,
                     host_w: self.host_w,
                     host_h: self.host_h,
                 });
