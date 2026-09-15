@@ -187,23 +187,12 @@ static void vt_apply_bitrate(VTCompressionSessionRef s, uint32_t bitrate) {
     CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
-    // Hard cap over a 1s window so IDRs cannot dump 80 Mbps onto the LAN.
-    int64_t bytes = (int64_t)(bitrate / 8);
-    double seconds = 1.0;
-    CFNumberRef nbytes = CFNumberCreate(NULL, kCFNumberSInt64Type, &bytes);
-    CFNumberRef nsec = CFNumberCreate(NULL, kCFNumberDoubleType, &seconds);
-    const void *vals[2] = { nbytes, nsec };
-    CFArrayRef limits = CFArrayCreate(kCFAllocatorDefault, vals, 2, &kCFTypeArrayCallBacks);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_DataRateLimits, limits);
-    CFRelease(limits);
-    CFRelease(nbytes);
-    CFRelease(nsec);
 }
 
 void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv444) {
     VtEnc *e = calloc(1, sizeof(VtEnc));
     if (!e) return NULL;
-    e->bitrate = bitrate ? bitrate : 20000000;
+    e->bitrate = bitrate ? bitrate : 40000000;
     e->pending = [NSMutableData data];
     e->sem = dispatch_semaphore_create(0);
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -219,16 +208,15 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     CFNumberRef dly = CFNumberCreate(NULL, kCFNumberIntType, &delay);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxFrameDelayCount, dly);
     CFRelease(dly);
-    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
     int fps = 60;
     CFNumberRef efps = CFNumberCreate(NULL, kCFNumberIntType, &fps);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate, efps);
     CFRelease(efps);
-    int gop = 60;
+    int gop = 240;
     CFNumberRef kgop = CFNumberCreate(NULL, kCFNumberIntType, &gop);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, kgop);
     CFRelease(kgop);
-    double gop_s = 1.0;
+    double gop_s = 4.0;
     CFNumberRef kgopd = CFNumberCreate(NULL, kCFNumberDoubleType, &gop_s);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kgopd);
     CFRelease(kgopd);

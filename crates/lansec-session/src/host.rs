@@ -151,8 +151,8 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     let mut pcm = PcmGather::default();
     let mut stats = HostStats::new();
     let mut last_bps = 0u32;
-    let mut next_frame_at = Instant::now();
-    const FRAME_DT: Duration = Duration::from_micros(16_667);
+    let mut last_encode = Instant::now() - Duration::from_millis(500);
+    const KEEP_ALIVE: Duration = Duration::from_millis(500);
     #[cfg(windows)]
     let mut loopback = lansec_audio::wasapi::Loopback::open().ok();
 
@@ -222,10 +222,15 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                     }
                 }
             }
-            let now = Instant::now();
-            if now >= next_frame_at {
-                if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
-                    if let Ok(Some(frame)) = cap.next_frame() {
+            let mut encoded = false;
+            if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
+                if let Ok(Some(frame)) = cap.next_frame() {
+                    // Client already holds the last picture. Re-encoding a static
+                    // desktop at 60 Hz produces tiny P-frames that pulse every IDR.
+                    let due = frame.info.fresh
+                        || force_idr
+                        || last_encode.elapsed() >= KEEP_ALIVE;
+                    if due {
                         if frame.info.fresh {
                             stats.fresh += 1;
                         } else {
@@ -235,6 +240,8 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                         match enc.encode(&frame, force_idr) {
                             Ok(Some(au)) => {
                                 force_idr = false;
+                                encoded = true;
+                                last_encode = Instant::now();
                                 let encode_us = t_enc.elapsed().as_micros() as u64;
                                 stats.note_encode(encode_us);
                                 let mut times = FrameTimes {
@@ -271,11 +278,6 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                         }
                     }
                 }
-                next_frame_at += FRAME_DT;
-                let caught_up = Instant::now();
-                while next_frame_at < caught_up {
-                    next_frame_at += FRAME_DT;
-                }
             }
             #[cfg(target_os = "macos")]
             if let Some(cap) = capture.as_mut() {
@@ -289,9 +291,8 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 }
             }
             stats.maybe_print(&bud, &input_count);
-            let wait = next_frame_at.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
-            if !wait.is_zero() {
-                thread::sleep(wait.min(Duration::from_micros(200)));
+            if !encoded {
+                thread::sleep(Duration::from_micros(200));
             }
         } else {
             thread::sleep(Duration::from_millis(1));

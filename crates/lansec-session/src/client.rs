@@ -206,15 +206,6 @@ impl ClientApp {
                 Incoming::Datagram { .. } => {}
             }
         }
-        if self
-            .last_video_at
-            .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
-        {
-            self.request_idr();
-            while self.video_q.front().is_some_and(|au| !au.is_keyframe) {
-                self.video_q.pop_front();
-            }
-        }
         if self.video_q.len() > 8 {
             if let Some(i) = self.video_q.iter().rposition(|au| au.is_keyframe) {
                 self.video_q.drain(0..i);
