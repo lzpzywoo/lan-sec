@@ -14,6 +14,7 @@ pub struct PresentStats {
 }
 
 pub struct Presenter {
+    #[allow(dead_code)]
     policy: FrameTimingPolicy,
     clock: SessionClock,
     pending: Option<DecodedFrame>,
@@ -34,18 +35,19 @@ impl Presenter {
         }
     }
 
-    /// Queue at most one decoded frame. Late frames are dropped.
+    /// Queue at most one decoded frame. A newer frame replaces a queued one.
+    ///
+    /// Do not compare decoder-local timestamps against this clock: the client
+    /// opens the decoder after handshake, so those origins differ by hundreds of
+    /// milliseconds and every remote frame looks late.
     pub fn submit(&mut self, frame: DecodedFrame, mut times: FrameTimes) {
         let now = self.clock.now_us();
-        if self.policy.should_drop(frame.decode_done_us, now) {
-            self.stats.dropped += 1;
-            tracing::debug!(dropped = self.stats.dropped, "drop late frame");
-            return;
+        if times.decode_done_us == 0 {
+            times.decode_done_us = now;
         }
         if self.pending.is_some() {
             self.stats.dropped += 1;
         }
-        times.decode_done_us = frame.decode_done_us;
         self.pending = Some(frame);
         self.stats.last = times;
     }

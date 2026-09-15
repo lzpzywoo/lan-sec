@@ -19,14 +19,15 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFSample, IMFTransform, MFCreateDXGIDeviceManager,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFTEnumEx, MFStartup, CODECAPI_AVLowLatencyMode,
-    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
-    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video,
-    MFVideoFormat_AYUV, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_VERSION,
+    eAVEncH265VProfile_Main_420_8, eAVEncH265VProfile_Main_444_8, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager,
+    IMFMediaBuffer, IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFTEnumEx, MFStartup, CODECAPI_AVLowLatencyMode, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video, MFVideoFormat_AYUV,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
@@ -40,11 +41,13 @@ pub fn probe() -> Vec<CodecCap> {
         warn!("HEVC decoder MFT not registered; install HEVC Video Extensions for Windows client decode");
         return Vec::new();
     }
-    let yuv444 = unsafe { hevc_decoder_ayuv() };
+    // AYUV as an output type is not HEVC Main 4:4:4. The inbox decoder lists AYUV
+    // for 4:2:0 CSC; Mac host would then send Main 4:4:4 that this MFT cannot decode.
+    let yuv444 = unsafe { hevc_decoder_main444() };
     if yuv444 {
-        info!("MF HEVC decoder lists AYUV (4:4:4)");
+        info!("MF HEVC decoder accepts Main 4:4:4 (AYUV)");
     } else {
-        info!("MF HEVC decoder: 4:2:0 only (no AYUV output type)");
+        info!("MF HEVC decoder: 4:2:0 only (Main 4:4:4 profile not accepted)");
     }
     let mut out = vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)];
     if yuv444 {
@@ -59,7 +62,7 @@ unsafe fn hevc_decoder_available() -> bool {
     find_hevc_mft().is_ok()
 }
 
-unsafe fn hevc_decoder_ayuv() -> bool {
+unsafe fn hevc_decoder_main444() -> bool {
     let Ok(transform) = find_hevc_mft() else {
         return false;
     };
@@ -69,6 +72,7 @@ unsafe fn hevc_decoder_ayuv() -> bool {
     };
     let _ = input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     let _ = input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC);
+    let _ = input.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32);
     if transform.SetInputType(0, &input, 0).is_err() {
         return false;
     }
@@ -164,6 +168,12 @@ unsafe fn open_inner(
     let input = MFCreateMediaType()?;
     input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+    let profile = if chroma == Chroma::Yuv444 {
+        eAVEncH265VProfile_Main_444_8.0 as u32
+    } else {
+        eAVEncH265VProfile_Main_420_8.0 as u32
+    };
+    input.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
     input.SetUINT64(&MF_MT_FRAME_SIZE, pack_wh(width.max(1), height.max(1)))?;
     input.SetUINT64(&MF_MT_FRAME_RATE, pack_wh(60, 1))?;
     input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
@@ -185,6 +195,7 @@ unsafe fn open_inner(
     Ok(Box::new(MfDecoder {
         width,
         height,
+        chroma,
         gpu: GpuHolder {
             device: gpu.device.clone(),
             context: gpu.context.clone(),
@@ -312,6 +323,7 @@ impl VideoCsc {
 struct MfDecoder {
     width: u32,
     height: u32,
+    chroma: Chroma,
     #[allow(dead_code)]
     gpu: GpuHolder,
     _manager: IMFDXGIDeviceManager,
@@ -386,7 +398,11 @@ impl MfDecoder {
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     let _ = ManuallyDrop::take(&mut out.pSample);
                     let _ = ManuallyDrop::take(&mut out.pEvents);
-                    let prefer = [MFVideoFormat_NV12, MFVideoFormat_AYUV];
+                    let prefer = if self.chroma == Chroma::Yuv444 {
+                        [MFVideoFormat_AYUV, MFVideoFormat_NV12]
+                    } else {
+                        [MFVideoFormat_NV12, MFVideoFormat_AYUV]
+                    };
                     set_output_type(&self.transform, self.width, self.height, &prefer)?;
                     continue;
                 }

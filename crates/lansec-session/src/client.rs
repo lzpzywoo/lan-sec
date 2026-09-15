@@ -56,6 +56,7 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         clock: SessionClock::new(),
         video_frames: 0,
         video_without_decoder: 0,
+        decode_idle: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -81,6 +82,7 @@ struct ClientApp {
     clock: SessionClock,
     video_frames: u64,
     video_without_decoder: u64,
+    decode_idle: u64,
 }
 
 impl ClientApp {
@@ -230,13 +232,24 @@ impl ClientApp {
         if let Some(dec) = self.decoder.as_mut() {
             match dec.decode(&au.annexb, au.is_keyframe) {
                 Ok(Some(frame)) => {
-                    au.times.decode_done_us = frame.decode_done_us.max(recv);
+                    self.decode_idle = 0;
+                    au.times.decode_done_us = self.clock.now_us();
                     self.presenter.submit(frame, au.times);
                     if let Some(frame) = self.presenter.take() {
                         self.present_frame(frame);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    self.decode_idle += 1;
+                    if self.decode_idle == 1 || self.decode_idle % 120 == 0 {
+                        warn!(
+                            n = self.decode_idle,
+                            key = au.is_keyframe,
+                            bytes = au.annexb.len(),
+                            "decoder produced no frame"
+                        );
+                    }
+                }
                 Err(e) => warn!("decode: {e}"),
             }
         }
@@ -249,11 +262,12 @@ impl ClientApp {
             let t = self.presenter.last_times();
             if self.video_frames % 120 == 1 {
                 eprintln!(
-                    "timing capture→encode {:.1}ms net {:.1}ms decode {:.1}ms glass {:.1}ms dropped {}",
+                    "timing capture→encode {:.1}ms net {:.1}ms decode {:.1}ms glass {:.1}ms presented {} dropped {}",
                     t.capture_to_encode_ms(),
                     t.net_ms(),
                     t.decode_ms(),
                     t.glass_ms(),
+                    self.presenter.stats().presented,
                     self.presenter.stats().dropped
                 );
             }
