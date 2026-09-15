@@ -44,6 +44,7 @@ typedef struct {
 @interface LansecSckSink : NSObject <SCStreamOutput, SCStreamDelegate>
 @property(atomic, assign) IOSurfaceRef surface;
 @property(atomic) uint64_t capture_us;
+@property(atomic) uint64_t gen;
 @property(atomic) uint32_t width;
 @property(atomic) uint32_t height;
 @property(strong) NSMutableData *audio;
@@ -80,19 +81,22 @@ typedef struct {
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pb) return;
     IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
-    if (surf) CFRetain(surf);
+    if (!surf) return;
+    CFRetain(surf);
     IOSurfaceRef old = self.surface;
     self.surface = surf;
     if (old) CFRelease(old);
     self.capture_us = mach_absolute_time() / 1000;
     self.width = (uint32_t)CVPixelBufferGetWidth(pb);
     self.height = (uint32_t)CVPixelBufferGetHeight(pb);
+    self.gen = self.gen + 1;
 }
 @end
 
 typedef struct {
     SCStream *stream;
     LansecSckSink *sink;
+    uint64_t last_gen;
 } SckCap;
 
 static uint64_t now_us(void) {
@@ -178,10 +182,28 @@ int lansec_vt_probe_decode_444(void) {
     return 1;
 }
 
+static void vt_apply_bitrate(VTCompressionSessionRef s, uint32_t bitrate) {
+    if (!s || !bitrate) return;
+    CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, br);
+    CFRelease(br);
+    // Hard cap over a 1s window so IDRs cannot dump 80 Mbps onto the LAN.
+    int64_t bytes = (int64_t)(bitrate / 8);
+    double seconds = 1.0;
+    CFNumberRef nbytes = CFNumberCreate(NULL, kCFNumberSInt64Type, &bytes);
+    CFNumberRef nsec = CFNumberCreate(NULL, kCFNumberDoubleType, &seconds);
+    const void *vals[2] = { nbytes, nsec };
+    CFArrayRef limits = CFArrayCreate(kCFAllocatorDefault, vals, 2, &kCFTypeArrayCallBacks);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_DataRateLimits, limits);
+    CFRelease(limits);
+    CFRelease(nbytes);
+    CFRelease(nsec);
+}
+
 void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv444) {
     VtEnc *e = calloc(1, sizeof(VtEnc));
     if (!e) return NULL;
-    e->bitrate = bitrate ? bitrate : 40000000;
+    e->bitrate = bitrate ? bitrate : 20000000;
     e->pending = [NSMutableData data];
     e->sem = dispatch_semaphore_create(0);
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -198,17 +220,19 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxFrameDelayCount, dly);
     CFRelease(dly);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
-    CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &e->bitrate);
-    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, br);
-    CFRelease(br);
     int fps = 60;
     CFNumberRef efps = CFNumberCreate(NULL, kCFNumberIntType, &fps);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate, efps);
     CFRelease(efps);
-    int gop = 120;
+    int gop = 60;
     CFNumberRef kgop = CFNumberCreate(NULL, kCFNumberIntType, &gop);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, kgop);
     CFRelease(kgop);
+    double gop_s = 1.0;
+    CFNumberRef kgopd = CFNumberCreate(NULL, kCFNumberDoubleType, &gop_s);
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kgopd);
+    CFRelease(kgopd);
+    vt_apply_bitrate(e->session, e->bitrate);
     if (yuv444) {
         if (VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main444_AutoLevel) != noErr) {
             lansec_vt_close(e);
@@ -234,11 +258,9 @@ void lansec_vt_close(void *session) {
 
 void lansec_vt_set_bitrate(void *session, uint32_t bitrate) {
     VtEnc *e = (VtEnc *)session;
-    if (!e || !e->session) return;
+    if (!e || !e->session || !bitrate) return;
     e->bitrate = bitrate;
-    CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
-    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, br);
-    CFRelease(br);
+    vt_apply_bitrate(e->session, bitrate);
 }
 
 int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *out, int cap, int *len, int *key) {
@@ -503,12 +525,15 @@ void lansec_sck_stop(void *cap) {
     free(c);
 }
 
-void *lansec_sck_next(void *cap, uint64_t *capture_us) {
+void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh) {
     SckCap *c = (SckCap *)cap;
     if (!c) return NULL;
     IOSurfaceRef s = c->sink.surface;
-    c->sink.surface = nil;
     if (!s) return NULL;
+    CFRetain(s);
+    uint64_t gen = c->sink.gen;
+    if (fresh) *fresh = (gen != c->last_gen) ? 1 : 0;
+    c->last_gen = gen;
     if (capture_us) *capture_us = c->sink.capture_us;
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, s, NULL, &pb);

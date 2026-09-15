@@ -58,7 +58,7 @@ pub fn run_loopback() -> Result<()> {
     let cfg = lansec_encode::EncoderConfig {
         width: w,
         height: h,
-        bitrate_bps: 40_000_000,
+        bitrate_bps: 20_000_000,
         prefer_444: true,
     };
     #[cfg(windows)]

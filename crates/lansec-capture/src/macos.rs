@@ -6,7 +6,7 @@ use crate::{CaptureError, FrameInfo, GpuFrame, GpuFrameInner, Result};
 unsafe extern "C" {
     fn lansec_sck_start(width: *mut u32, height: *mut u32) -> *mut c_void;
     fn lansec_sck_stop(cap: *mut c_void);
-    fn lansec_sck_next(cap: *mut c_void, capture_us: *mut u64) -> *mut c_void;
+    fn lansec_sck_next(cap: *mut c_void, capture_us: *mut u64, fresh: *mut i32) -> *mut c_void;
     fn lansec_sck_next_audio(cap: *mut c_void, out: *mut f32, cap_samples: i32) -> i32;
     fn lansec_cf_release(obj: *mut c_void);
 }
@@ -29,6 +29,7 @@ pub struct SckCapture {
     ptr: *mut c_void,
     width: u32,
     height: u32,
+    audio_scratch: Vec<f32>,
 }
 
 unsafe impl Send for SckCapture {}
@@ -44,7 +45,12 @@ impl SckCapture {
             ));
         }
         tracing::info!(width, height, "ScreenCaptureKit started");
-        Ok(Self { ptr, width, height })
+        Ok(Self {
+            ptr,
+            width,
+            height,
+            audio_scratch: vec![0f32; 480 * 2 * 8],
+        })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -53,7 +59,8 @@ impl SckCapture {
 
     pub fn next_frame(&mut self) -> Result<Option<GpuFrame>> {
         let mut ts = 0u64;
-        let pb = unsafe { lansec_sck_next(self.ptr, &mut ts) };
+        let mut fresh = 0i32;
+        let pb = unsafe { lansec_sck_next(self.ptr, &mut ts, &mut fresh) };
         if pb.is_null() {
             return Ok(None);
         }
@@ -62,6 +69,7 @@ impl SckCapture {
                 width: self.width,
                 height: self.height,
                 capture_us: ts,
+                fresh: fresh != 0,
             },
             inner: GpuFrameInner::IoSurface(IoSurfaceFrame {
                 width: self.width,
@@ -71,14 +79,21 @@ impl SckCapture {
         }))
     }
 
-    pub fn next_audio(&mut self) -> Vec<f32> {
-        let mut buf = vec![0f32; 480 * 2 * 8];
-        let n = unsafe { lansec_sck_next_audio(self.ptr, buf.as_mut_ptr(), buf.len() as i32) };
+    pub fn next_audio(&mut self) -> &[f32] {
+        if self.audio_scratch.len() < 480 * 2 * 8 {
+            self.audio_scratch.resize(480 * 2 * 8, 0.0);
+        }
+        let n = unsafe {
+            lansec_sck_next_audio(
+                self.ptr,
+                self.audio_scratch.as_mut_ptr(),
+                self.audio_scratch.len() as i32,
+            )
+        };
         if n <= 0 {
-            Vec::new()
+            &[]
         } else {
-            buf.truncate(n as usize);
-            buf
+            &self.audio_scratch[..n as usize]
         }
     }
 }

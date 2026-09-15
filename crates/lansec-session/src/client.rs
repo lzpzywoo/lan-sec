@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,8 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         win_pump_max_us: 0,
         win_gap_max_us: 0,
         last_video_at: None,
+        last_idr_req: None,
+        video_q: VecDeque::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -108,6 +111,8 @@ struct ClientApp {
     win_pump_max_us: u64,
     win_gap_max_us: u64,
     last_video_at: Option<Instant>,
+    last_idr_req: Option<Instant>,
+    video_q: VecDeque<VideoAccessUnit>,
 }
 
 impl ClientApp {
@@ -121,6 +126,16 @@ impl ClientApp {
                 InputEvent::MouseMoveAbs { .. } | InputEvent::MouseMoveRel { .. }
             );
             let _ = self.bud.send_with(Channel::Input, &bytes, 0, false, reliable);
+        }
+    }
+
+    fn request_idr(&mut self) {
+        if self.last_idr_req.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            return;
+        }
+        self.last_idr_req = Some(Instant::now());
+        if let Ok(bytes) = encode(&ControlMsg::RequestIdr) {
+            let _ = self.bud.send(Channel::Control, &bytes, 0, true);
         }
     }
 
@@ -139,11 +154,7 @@ impl ClientApp {
                         let _ = self.bud.send(Channel::Control, &bytes, 0, true);
                     }
                 }
-                Incoming::NeedIdr => {
-                    if let Ok(bytes) = encode(&ControlMsg::RequestIdr) {
-                        let _ = self.bud.send(Channel::Control, &bytes, 0, true);
-                    }
-                }
+                Incoming::NeedIdr => self.request_idr(),
                 Incoming::Datagram {
                     channel: Channel::Control,
                     payload,
@@ -175,8 +186,8 @@ impl ClientApp {
                     payload,
                     ..
                 } => {
-                    if let Ok(mut au) = decode::<VideoAccessUnit>(&payload) {
-                        self.on_video(&mut au);
+                    if let Ok(au) = decode::<VideoAccessUnit>(&payload) {
+                        self.video_q.push_back(au);
                     }
                 }
                 Incoming::Datagram {
@@ -194,6 +205,26 @@ impl ClientApp {
                 }
                 Incoming::Datagram { .. } => {}
             }
+        }
+        if self
+            .last_video_at
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
+        {
+            self.request_idr();
+            while self.video_q.front().is_some_and(|au| !au.is_keyframe) {
+                self.video_q.pop_front();
+            }
+        }
+        if self.video_q.len() > 8 {
+            if let Some(i) = self.video_q.iter().rposition(|au| au.is_keyframe) {
+                self.video_q.drain(0..i);
+            } else {
+                self.video_q.clear();
+                self.request_idr();
+            }
+        }
+        if let Some(mut au) = self.video_q.pop_front() {
+            self.on_video(&mut au);
         }
         self.win_pump_max_us = self.win_pump_max_us.max(t0.elapsed().as_micros() as u64);
     }
@@ -299,6 +330,9 @@ impl ClientApp {
                             bytes = au.annexb.len(),
                             "decoder produced no frame"
                         );
+                    }
+                    if self.decode_idle >= 2 {
+                        self.request_idr();
                     }
                 }
                 Err(e) => {

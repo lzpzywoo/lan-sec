@@ -17,7 +17,7 @@ int lansec_vt_dec_decode(void *session, const uint8_t *data, int len, void **pix
 
 void *lansec_sck_start(uint32_t *width, uint32_t *height);
 void lansec_sck_stop(void *cap);
-void *lansec_sck_next(void *cap, uint64_t *capture_us);
+void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh);
 int lansec_sck_next_audio(void *cap, float *out, int cap_samples);
 void lansec_cf_release(void *obj);
 

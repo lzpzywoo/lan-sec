@@ -18,6 +18,8 @@ pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
     pub capture_us: u64,
+    /// False when this is a re-encode of the last desktop surface (no SCK/DXGI update).
+    pub fresh: bool,
 }
 
 pub struct GpuFrame {
@@ -104,7 +106,7 @@ impl CaptureSession {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn next_audio(&mut self) -> Vec<f32> {
+    pub fn next_audio(&mut self) -> &[f32] {
         self.inner.next_audio()
     }
 }

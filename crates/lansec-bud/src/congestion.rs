@@ -25,10 +25,10 @@ pub struct CongestionStats {
 impl CongestionController {
     pub fn lan_default() -> Self {
         Self {
-            // 1080p desktop on a LAN needs tens of Mbps or text turns to mush.
-            target_bps: 80_000_000,
-            min_bps: 40_000_000,
-            max_bps: 150_000_000,
+            // Desktop text on a LAN: quality/low-latency cap, not 80 Mbps CBR.
+            target_bps: 20_000_000,
+            min_bps: 8_000_000,
+            max_bps: 40_000_000,
             rtt_us_ewma: 1_000.0,
             loss_ppm_ewma: 0.0,
             in_flight_bytes: 0,

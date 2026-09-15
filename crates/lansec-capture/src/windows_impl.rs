@@ -109,6 +109,7 @@ pub struct DxgiCapture {
     width: u32,
     height: u32,
     origin: Instant,
+    have_frame: bool,
 }
 
 impl DxgiCapture {
@@ -155,6 +156,7 @@ impl DxgiCapture {
             width,
             height,
             origin: Instant::now(),
+            have_frame: false,
         })
     }
 
@@ -167,9 +169,14 @@ impl DxgiCapture {
     unsafe fn acquire(&mut self) -> Result<Option<GpuFrame>> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match self.duplication.AcquireNextFrame(16, &mut info, &mut resource) {
+        match self.duplication.AcquireNextFrame(0, &mut info, &mut resource) {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                if self.have_frame {
+                    return Ok(Some(self.repeat_frame()));
+                }
+                return Ok(None);
+            }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 let _ = self.duplication.ReleaseFrame();
                 self.recreate()?;
@@ -186,16 +193,32 @@ impl DxgiCapture {
         let dst: ID3D11Resource = self.owned.cast()?;
         self.gpu.context.CopyResource(&dst, &src);
         let _ = self.duplication.ReleaseFrame();
+        self.have_frame = true;
         Ok(Some(GpuFrame {
             info: FrameInfo {
                 width: self.width,
                 height: self.height,
                 capture_us: self.origin.elapsed().as_micros() as u64,
+                fresh: true,
             },
             inner: GpuFrameInner::D3d11(D3d11Frame {
                 texture: self.owned.clone(),
             }),
         }))
+    }
+
+    fn repeat_frame(&self) -> GpuFrame {
+        GpuFrame {
+            info: FrameInfo {
+                width: self.width,
+                height: self.height,
+                capture_us: self.origin.elapsed().as_micros() as u64,
+                fresh: false,
+            },
+            inner: GpuFrameInner::D3d11(D3d11Frame {
+                texture: self.owned.clone(),
+            }),
+        }
     }
 }
 

@@ -31,6 +31,8 @@ struct HostStats {
     last: Instant,
     frames: u32,
     skip: u32,
+    fresh: u32,
+    repeat: u32,
     encode_us: u64,
     encode_max_us: u64,
     send_us: u64,
@@ -44,6 +46,8 @@ impl HostStats {
             last: Instant::now(),
             frames: 0,
             skip: 0,
+            fresh: 0,
+            repeat: 0,
             encode_us: 0,
             encode_max_us: 0,
             send_us: 0,
@@ -82,7 +86,7 @@ impl HostStats {
         let inputs = input.swap(0, Ordering::Relaxed);
         let link = bud.snapshot_link();
         eprintln!(
-            "host {:.2}s fps={:.1} video={:.1}Mbps udp_tx={:.1}Mbps target={:.1}Mbps encode={:.1}/{:.1}ms send={:.1}/{:.1}ms skip={} input={:.0}/s rtt={:.1}ms loss={:.2}% wblock={} rel={} hold={} vbuf={}",
+            "host {:.2}s fps={:.1} video={:.1}Mbps udp_tx={:.1}Mbps target={:.1}Mbps encode={:.1}/{:.1}ms send={:.1}/{:.1}ms skip={} fresh={} repeat={} input={:.0}/s rtt={:.1}ms loss={:.2}% wblock={} rel={} hold={} vbuf={}",
             dt,
             fps,
             video_mbps,
@@ -93,6 +97,8 @@ impl HostStats {
             send_avg,
             self.send_max_us as f32 / 1000.0,
             self.skip,
+            self.fresh,
+            self.repeat,
             inputs as f32 / dt,
             link.rtt_us as f32 / 1000.0,
             link.loss_ppm as f32 / 10_000.0,
@@ -113,7 +119,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     })?);
     info!(addr = %bud.local_addr()?, "host listening");
     eprintln!(
-        "host stats every 0.5s — video=HEVC Mbps  udp_tx=socket Mbps  target=setpoint  encode=avg/max  skip=encode miss  wblock=UDP full  rel=unacked"
+        "host stats every 0.5s — video=HEVC Mbps  udp_tx=socket Mbps  target=setpoint  encode=avg/max  skip=encode miss  fresh/repeat=SCK  wblock=UDP full"
     );
     let local = local_caps();
     let (tx, rx) = mpsc::channel::<HostCmd>();
@@ -144,6 +150,9 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     let mut opus = OpusRoundtrip::new().ok();
     let mut pcm = PcmGather::default();
     let mut stats = HostStats::new();
+    let mut last_bps = 0u32;
+    let mut next_frame_at = Instant::now();
+    const FRAME_DT: Duration = Duration::from_micros(16_667);
     #[cfg(windows)]
     let mut loopback = lansec_audio::wasapi::Loopback::open().ok();
 
@@ -157,6 +166,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 format = None;
                 encoder = None;
                 force_idr = true;
+                last_bps = 0;
                 need_idr.store(true, Ordering::Relaxed);
             }
             Ok(HostCmd::CapsOffer(remote)) => {
@@ -169,6 +179,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                         }
                         format = Some(fmt);
                         encoder = None;
+                        last_bps = 0;
                     }
                     Err(e) => warn!("negotiate: {e}"),
                 }
@@ -178,6 +189,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 println!("stream format: {}", fmt.chroma_label());
                 format = Some(fmt);
                 encoder = None;
+                last_bps = 0;
             }
             Ok(HostCmd::Bye) => return Ok(()),
             Err(TryRecvError::Empty) => {}
@@ -210,49 +222,65 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                     }
                 }
             }
-            let mut encoded = false;
-            if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
-                if let Ok(Some(frame)) = cap.next_frame() {
-                    let t_enc = Instant::now();
-                    match enc.encode(&frame, force_idr) {
-                        Ok(Some(au)) => {
-                            force_idr = false;
-                            encoded = true;
-                            let encode_us = t_enc.elapsed().as_micros() as u64;
-                            stats.note_encode(encode_us);
-                            let mut times = FrameTimes {
-                                capture_us: frame.info.capture_us,
-                                encode_done_us: frame.info.capture_us + encode_us,
-                                ..Default::default()
-                            };
-                            times.send_us = times.encode_done_us;
-                            let video_bytes = au.annexb.len() as u64;
-                            let packet = VideoAccessUnit {
-                                frame_id,
-                                is_keyframe: au.is_keyframe,
-                                width: frame.info.width as u16,
-                                height: frame.info.height as u16,
-                                times,
-                                annexb: au.annexb,
-                            };
-                            frame_id = frame_id.wrapping_add(1);
-                            let t_send = Instant::now();
-                            if let Ok(bytes) = encode(&packet) {
-                                let _ = bud.send(Channel::Video, &bytes, packet.frame_id, packet.is_keyframe);
-                            }
-                            stats.note_send(t_send.elapsed().as_micros() as u64);
-                            stats.frames += 1;
-                            stats.video_bytes += video_bytes;
-                            enc.set_bitrate(bitrate.load(Ordering::Relaxed));
+            let now = Instant::now();
+            if now >= next_frame_at {
+                if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
+                    if let Ok(Some(frame)) = cap.next_frame() {
+                        if frame.info.fresh {
+                            stats.fresh += 1;
+                        } else {
+                            stats.repeat += 1;
                         }
-                        Ok(None) => stats.skip += 1,
-                        Err(e) => warn!("encode: {e}"),
+                        let t_enc = Instant::now();
+                        match enc.encode(&frame, force_idr) {
+                            Ok(Some(au)) => {
+                                force_idr = false;
+                                let encode_us = t_enc.elapsed().as_micros() as u64;
+                                stats.note_encode(encode_us);
+                                let mut times = FrameTimes {
+                                    capture_us: frame.info.capture_us,
+                                    encode_done_us: frame.info.capture_us + encode_us,
+                                    ..Default::default()
+                                };
+                                times.send_us = times.encode_done_us;
+                                let video_bytes = au.annexb.len() as u64;
+                                let packet = VideoAccessUnit {
+                                    frame_id,
+                                    is_keyframe: au.is_keyframe,
+                                    width: frame.info.width as u16,
+                                    height: frame.info.height as u16,
+                                    times,
+                                    annexb: au.annexb,
+                                };
+                                frame_id = frame_id.wrapping_add(1);
+                                let t_send = Instant::now();
+                                if let Ok(bytes) = encode(&packet) {
+                                    let _ = bud.send(Channel::Video, &bytes, packet.frame_id, packet.is_keyframe);
+                                }
+                                stats.note_send(t_send.elapsed().as_micros() as u64);
+                                stats.frames += 1;
+                                stats.video_bytes += video_bytes;
+                                let bps = bitrate.load(Ordering::Relaxed);
+                                if bps != last_bps {
+                                    enc.set_bitrate(bps);
+                                    last_bps = bps;
+                                }
+                            }
+                            Ok(None) => stats.skip += 1,
+                            Err(e) => warn!("encode: {e}"),
+                        }
                     }
+                }
+                next_frame_at += FRAME_DT;
+                let caught_up = Instant::now();
+                while next_frame_at < caught_up {
+                    next_frame_at += FRAME_DT;
                 }
             }
             #[cfg(target_os = "macos")]
             if let Some(cap) = capture.as_mut() {
-                pump_audio(&bud, &mut opus, &mut pcm, &cap.next_audio());
+                let samples = cap.next_audio();
+                pump_audio(&bud, &mut opus, &mut pcm, samples);
             }
             #[cfg(windows)]
             if let Some(lb) = loopback.as_mut() {
@@ -261,8 +289,9 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 }
             }
             stats.maybe_print(&bud, &input_count);
-            if !encoded {
-                thread::sleep(Duration::from_micros(200));
+            let wait = next_frame_at.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
+            if !wait.is_zero() {
+                thread::sleep(wait.min(Duration::from_micros(200)));
             }
         } else {
             thread::sleep(Duration::from_millis(1));
