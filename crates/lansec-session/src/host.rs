@@ -12,6 +12,9 @@ use lansec_capture::CaptureSession;
 use lansec_encode::{EncoderConfig, HardwareEncoder};
 #[cfg(not(windows))]
 use lansec_encode::open_encoder;
+#[cfg(target_os = "macos")]
+use lansec_input::{inject_with_buttons, MouseButtons};
+#[cfg(not(target_os = "macos"))]
 use lansec_input::inject;
 use lansec_protocol::{
     decode, encode, Caps, Channel, Chroma, ControlMsg, FrameTimes, InputEvent, NegotiatedFormat, VideoAccessUnit,
@@ -151,8 +154,12 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     let mut pcm = PcmGather::default();
     let mut stats = HostStats::new();
     let mut last_bps = 0u32;
-    let mut last_encode = Instant::now() - Duration::from_millis(500);
-    const KEEP_ALIVE: Duration = Duration::from_millis(500);
+    let mut last_encode = Instant::now();
+    let mut last_content_at = Instant::now() - Duration::from_secs(1);
+    const TARGET_FPS: u32 = 60;
+    const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS as u64);
+    const MOTION_BOOST_BPS: u32 = 80_000_000;
+    const MOTION_IDLE: Duration = Duration::from_millis(500);
     #[cfg(windows)]
     let mut loopback = lansec_audio::wasapi::Loopback::open().ok();
 
@@ -173,7 +180,21 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 match negotiate_with_size(&local, &remote, capture.as_ref()) {
                     Ok(fmt) => {
                         info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
-                        println!("stream format: {}", fmt.chroma_label());
+                        if fmt.chroma == Chroma::Yuv420 {
+                            println!(
+                                "stream format: {} encode={:?} decode={:?} (4:2:0 — text edges chroma-subsampled)",
+                                fmt.chroma_label(),
+                                fmt.encode,
+                                fmt.decode
+                            );
+                        } else {
+                            println!(
+                                "stream format: {} encode={:?} decode={:?}",
+                                fmt.chroma_label(),
+                                fmt.encode,
+                                fmt.decode
+                            );
+                        }
                         if let Ok(bytes) = encode(&ControlMsg::CapsAccept { format: fmt }) {
                             let _ = bud.send(Channel::Control, &bytes, 0, true);
                         }
@@ -225,16 +246,21 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
             let mut encoded = false;
             if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
                 if let Ok(Some(frame)) = cap.next_frame() {
-                    // Client already holds the last picture. Re-encoding a static
-                    // desktop at 60 Hz produces tiny P-frames that pulse every IDR.
-                    let due = frame.info.fresh
-                        || force_idr
-                        || last_encode.elapsed() >= KEEP_ALIVE;
-                    if due {
+                    // Re-encoding duplicate SCK frames makes tiny P-frames that flicker
+                    // against periodic IDRs. Only encode when ScreenCaptureKit reports new pixels.
+                    let due = frame.info.fresh || force_idr;
+                    if !due {
+                        if last_encode.elapsed() >= FRAME_INTERVAL {
+                            stats.repeat += 1;
+                            last_encode += FRAME_INTERVAL;
+                            if last_encode.elapsed() > FRAME_INTERVAL {
+                                last_encode = Instant::now();
+                            }
+                        }
+                    } else {
                         if frame.info.fresh {
                             stats.fresh += 1;
-                        } else {
-                            stats.repeat += 1;
+                            last_content_at = Instant::now();
                         }
                         let t_enc = Instant::now();
                         match enc.encode(&frame, force_idr) {
@@ -267,7 +293,12 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                                 stats.note_send(t_send.elapsed().as_micros() as u64);
                                 stats.frames += 1;
                                 stats.video_bytes += video_bytes;
-                                let bps = bitrate.load(Ordering::Relaxed);
+                                let cong_bps = bitrate.load(Ordering::Relaxed);
+                                let bps = if last_content_at.elapsed() < MOTION_IDLE {
+                                    cong_bps.max(MOTION_BOOST_BPS)
+                                } else {
+                                    cong_bps
+                                };
                                 if bps != last_bps {
                                     enc.set_bitrate(bps);
                                     last_bps = bps;
@@ -320,6 +351,8 @@ fn net_loop(
         }
         let idle = incoming.is_empty();
         let mut last_move = None;
+        #[cfg(target_os = "macos")]
+        let mut mouse_buttons = MouseButtons::default();
         for msg in incoming {
             match msg {
                 Incoming::Established { peer } => {
@@ -369,9 +402,15 @@ fn net_loop(
                             last_move = Some(ev);
                         } else {
                             if let Some(mv) = last_move.take() {
+                                #[cfg(target_os = "macos")]
+                                let _ = inject_with_buttons(&mv, &mut mouse_buttons);
+                                #[cfg(not(target_os = "macos"))]
                                 let _ = inject(&mv);
                                 input_count.fetch_add(1, Ordering::Relaxed);
                             }
+                            #[cfg(target_os = "macos")]
+                            let _ = inject_with_buttons(&ev, &mut mouse_buttons);
+                            #[cfg(not(target_os = "macos"))]
                             let _ = inject(&ev);
                             input_count.fetch_add(1, Ordering::Relaxed);
                         }
@@ -381,11 +420,14 @@ fn net_loop(
             }
         }
         if let Some(mv) = last_move {
+            #[cfg(target_os = "macos")]
+            let _ = inject_with_buttons(&mv, &mut mouse_buttons);
+            #[cfg(not(target_os = "macos"))]
             let _ = inject(&mv);
             input_count.fetch_add(1, Ordering::Relaxed);
         }
         if idle {
-            thread::sleep(Duration::from_micros(250));
+            thread::sleep(Duration::from_micros(50));
         }
     }
 }

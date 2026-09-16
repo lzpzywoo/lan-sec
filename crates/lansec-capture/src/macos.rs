@@ -6,7 +6,8 @@ use crate::{CaptureError, FrameInfo, GpuFrame, GpuFrameInner, Result};
 unsafe extern "C" {
     fn lansec_sck_start(width: *mut u32, height: *mut u32) -> *mut c_void;
     fn lansec_sck_stop(cap: *mut c_void);
-    fn lansec_sck_next(cap: *mut c_void, capture_us: *mut u64, fresh: *mut i32) -> *mut c_void;
+    fn lansec_sck_next(cap: *mut c_void, capture_us: *mut u64, fresh: *mut i32, content_gen: *mut u64)
+        -> *mut c_void;
     fn lansec_sck_next_audio(cap: *mut c_void, out: *mut f32, cap_samples: i32) -> i32;
     fn lansec_cf_release(obj: *mut c_void);
 }
@@ -60,7 +61,8 @@ impl SckCapture {
     pub fn next_frame(&mut self) -> Result<Option<GpuFrame>> {
         let mut ts = 0u64;
         let mut fresh = 0i32;
-        let pb = unsafe { lansec_sck_next(self.ptr, &mut ts, &mut fresh) };
+        let mut content_gen = 0u64;
+        let pb = unsafe { lansec_sck_next(self.ptr, &mut ts, &mut fresh, &mut content_gen) };
         if pb.is_null() {
             return Ok(None);
         }
@@ -70,6 +72,7 @@ impl SckCapture {
                 height: self.height,
                 capture_us: ts,
                 fresh: fresh != 0,
+                content_gen,
             },
             inner: GpuFrameInner::IoSurface(IoSurfaceFrame {
                 width: self.width,

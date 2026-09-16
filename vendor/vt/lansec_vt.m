@@ -21,6 +21,16 @@
 #ifndef kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality
 #define kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality CFSTR("PrioritizeEncodingSpeedOverQuality")
 #endif
+#ifndef kVTCompressionPropertyKey_SpatialAdaptiveQPLevel
+#define kVTCompressionPropertyKey_SpatialAdaptiveQPLevel CFSTR("SpatialAdaptiveQPLevel")
+#endif
+#ifndef kVTQPModulationLevel_Disable
+#define kVTQPModulationLevel_Disable 0
+#endif
+
+// High quality floor for desktop/text. AverageBitRate alone is only a soft ceiling under
+// low-latency VBR — the encoder can look sharp-but-blurry at 1 Mbps while target is 40 Mbps.
+static const float kLansecVtQuality = 0.88f;
 
 typedef struct {
     VTCompressionSessionRef session;
@@ -41,14 +51,18 @@ typedef struct {
     int64_t pts;
 } VtDec;
 
-@interface LansecSckSink : NSObject <SCStreamOutput, SCStreamDelegate>
-@property(atomic, assign) IOSurfaceRef surface;
+@interface LansecSckSink : NSObject <SCStreamOutput, SCStreamDelegate> {
+    IOSurfaceRef _surface;
+}
 @property(atomic) uint64_t capture_us;
 @property(atomic) uint64_t gen;
+@property(atomic) uint64_t content_gen;
 @property(atomic) uint32_t width;
 @property(atomic) uint32_t height;
 @property(strong) NSMutableData *audio;
 @property(strong) NSLock *audioLock;
+@property(strong) NSLock *surfaceLock;
+- (IOSurfaceRef)copySurfaceCaptureUs:(uint64_t *)capture_us gen:(uint64_t *)gen;
 @end
 
 @implementation LansecSckSink
@@ -57,13 +71,25 @@ typedef struct {
     if (self) {
         _audio = [NSMutableData data];
         _audioLock = [NSLock new];
+        _surfaceLock = [NSLock new];
     }
     return self;
 }
 - (void)dealloc {
+    [_surfaceLock lock];
     IOSurfaceRef old = _surface;
     _surface = NULL;
+    [_surfaceLock unlock];
     if (old) CFRelease(old);
+}
+- (IOSurfaceRef)copySurfaceCaptureUs:(uint64_t *)capture_us gen:(uint64_t *)gen {
+    [_surfaceLock lock];
+    IOSurfaceRef s = _surface;
+    if (s) CFRetain(s);
+    if (capture_us) *capture_us = _capture_us;
+    if (gen) *gen = _gen;
+    [_surfaceLock unlock];
+    return s;
 }
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
     if (type == SCStreamOutputTypeAudio) {
@@ -82,14 +108,28 @@ typedef struct {
     if (!pb) return;
     IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
     if (!surf) return;
+    int status = SCFrameStatusComplete;
+    CFArrayRef attArr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+    if (attArr && CFArrayGetCount(attArr) > 0) {
+        CFDictionaryRef att = (CFDictionaryRef)CFArrayGetValueAtIndex(attArr, 0);
+        CFTypeRef st = CFDictionaryGetValue(att, SCStreamFrameInfoStatus);
+        if (st && CFGetTypeID(st) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)st, kCFNumberIntType, &status);
+        }
+    }
     CFRetain(surf);
-    IOSurfaceRef old = self.surface;
-    self.surface = surf;
+    [_surfaceLock lock];
+    IOSurfaceRef old = _surface;
+    _surface = surf;
+    _capture_us = mach_absolute_time() / 1000;
+    _width = (uint32_t)CVPixelBufferGetWidth(pb);
+    _height = (uint32_t)CVPixelBufferGetHeight(pb);
+    _gen += 1;
+    if (status != SCFrameStatusIdle) {
+        _content_gen += 1;
+    }
+    [_surfaceLock unlock];
     if (old) CFRelease(old);
-    self.capture_us = mach_absolute_time() / 1000;
-    self.width = (uint32_t)CVPixelBufferGetWidth(pb);
-    self.height = (uint32_t)CVPixelBufferGetHeight(pb);
-    self.gen = self.gen + 1;
 }
 @end
 
@@ -97,6 +137,7 @@ typedef struct {
     SCStream *stream;
     LansecSckSink *sink;
     uint64_t last_gen;
+    uint64_t last_content_gen;
 } SckCap;
 
 static uint64_t now_us(void) {
@@ -182,11 +223,45 @@ int lansec_vt_probe_decode_444(void) {
     return 1;
 }
 
-static void vt_apply_bitrate(VTCompressionSessionRef s, uint32_t bitrate) {
+static void vt_set_data_rate_limits(VTCompressionSessionRef s, uint32_t bitrate) {
+    int64_t bytes_per_sec = (int64_t)bitrate / 8;
+    int64_t window_sec = 1;
+    CFNumberRef bps = CFNumberCreate(NULL, kCFNumberSInt64Type, &bytes_per_sec);
+    CFNumberRef sec = CFNumberCreate(NULL, kCFNumberSInt64Type, &window_sec);
+    if (!bps || !sec) {
+        if (bps) CFRelease(bps);
+        if (sec) CFRelease(sec);
+        return;
+    }
+    const void *nums[] = { bps, sec };
+    CFArrayRef limits = CFArrayCreate(NULL, nums, 2, &kCFTypeArrayCallBacks);
+    if (limits) {
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_DataRateLimits, limits);
+        CFRelease(limits);
+    }
+    CFRelease(sec);
+    CFRelease(bps);
+}
+
+static void vt_apply_rate_control(VTCompressionSessionRef s, uint32_t bitrate) {
     if (!s || !bitrate) return;
+    float quality = kLansecVtQuality;
+    CFNumberRef q = CFNumberCreate(NULL, kCFNumberFloatType, &quality);
+    if (q) {
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_Quality, q);
+        CFRelease(q);
+    }
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanFalse);
     CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
+    vt_set_data_rate_limits(s, bitrate);
+    int spatial = kVTQPModulationLevel_Disable;
+    CFNumberRef sap = CFNumberCreate(NULL, kCFNumberIntType, &spatial);
+    if (sap) {
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_SpatialAdaptiveQPLevel, sap);
+        CFRelease(sap);
+    }
 }
 
 void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv444) {
@@ -220,7 +295,7 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     CFNumberRef kgopd = CFNumberCreate(NULL, kCFNumberDoubleType, &gop_s);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kgopd);
     CFRelease(kgopd);
-    vt_apply_bitrate(e->session, e->bitrate);
+    vt_apply_rate_control(e->session, e->bitrate);
     if (yuv444) {
         if (VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main444_AutoLevel) != noErr) {
             lansec_vt_close(e);
@@ -248,7 +323,7 @@ void lansec_vt_set_bitrate(void *session, uint32_t bitrate) {
     VtEnc *e = (VtEnc *)session;
     if (!e || !e->session || !bitrate) return;
     e->bitrate = bitrate;
-    vt_apply_bitrate(e->session, bitrate);
+    vt_apply_rate_control(e->session, bitrate);
 }
 
 int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *out, int cap, int *len, int *key) {
@@ -513,19 +588,23 @@ void lansec_sck_stop(void *cap) {
     free(c);
 }
 
-void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh) {
+void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh, uint64_t *content_gen) {
     SckCap *c = (SckCap *)cap;
-    if (!c) return NULL;
-    IOSurfaceRef s = c->sink.surface;
+    if (!c || !c->sink) return NULL;
+    uint64_t ts = 0;
+    uint64_t gen = 0;
+    IOSurfaceRef s = [c->sink copySurfaceCaptureUs:&ts gen:&gen];
     if (!s) return NULL;
-    CFRetain(s);
-    uint64_t gen = c->sink.gen;
-    if (fresh) *fresh = (gen != c->last_gen) ? 1 : 0;
+    uint64_t cg = c->sink.content_gen;
+    if (content_gen) *content_gen = cg;
+    if (fresh) *fresh = (cg != c->last_content_gen) ? 1 : 0;
+    c->last_content_gen = cg;
     c->last_gen = gen;
-    if (capture_us) *capture_us = c->sink.capture_us;
+    if (capture_us) *capture_us = ts;
     CVPixelBufferRef pb = NULL;
-    CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, s, NULL, &pb);
+    CVReturn st = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, s, NULL, &pb);
     CFRelease(s);
+    if (st != kCVReturnSuccess) return NULL;
     return pb;
 }
 
@@ -549,19 +628,31 @@ void lansec_cf_release(void *obj) {
     if (obj) CFRelease(obj);
 }
 
-int lansec_cg_mouse_abs(uint16_t x, uint16_t y) {
-    CGEventRef e = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, CGPointMake(x, y), kCGMouseButtonLeft);
+int lansec_cg_mouse_abs(uint16_t x, uint16_t y, int drag_button) {
+    CGEventType type = kCGEventMouseMoved;
+    CGMouseButton b = kCGMouseButtonLeft;
+    if (drag_button == 0) {
+        type = kCGEventLeftMouseDragged;
+        b = kCGMouseButtonLeft;
+    } else if (drag_button == 1) {
+        type = kCGEventRightMouseDragged;
+        b = kCGMouseButtonRight;
+    } else if (drag_button == 2) {
+        type = kCGEventOtherMouseDragged;
+        b = kCGMouseButtonCenter;
+    }
+    CGEventRef e = CGEventCreateMouseEvent(NULL, type, CGPointMake(x, y), b);
     if (!e) return 0;
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
     return 1;
 }
 
-int lansec_cg_mouse_rel(int16_t dx, int16_t dy) {
+int lansec_cg_mouse_rel(int16_t dx, int16_t dy, int drag_button) {
     CGEventRef loc = CGEventCreate(NULL);
     CGPoint p = CGEventGetLocation(loc);
     CFRelease(loc);
-    return lansec_cg_mouse_abs((uint16_t)(p.x + dx), (uint16_t)(p.y + dy));
+    return lansec_cg_mouse_abs((uint16_t)(p.x + dx), (uint16_t)(p.y + dy), drag_button);
 }
 
 int lansec_cg_button(uint8_t button, int down) {

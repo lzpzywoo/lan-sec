@@ -2,11 +2,47 @@ use lansec_protocol::InputEvent;
 
 use crate::InputError;
 
+/// Tracks which mouse buttons are down so moves become drag events on macOS.
+#[derive(Debug, Clone, Default)]
+pub struct MouseButtons {
+    down: [bool; 5],
+}
+
+impl MouseButtons {
+    pub fn drag_button(&self) -> i32 {
+        if self.down[0] {
+            return 0;
+        }
+        if self.down[1] {
+            return 1;
+        }
+        if self.down[2] {
+            return 2;
+        }
+        -1
+    }
+
+    fn set_button(&mut self, button: u8, down: bool) {
+        if (button as usize) < self.down.len() {
+            self.down[button as usize] = down;
+        }
+    }
+}
+
 pub fn inject(ev: &InputEvent) -> Result<(), InputError> {
+    inject_with_buttons(ev, &mut MouseButtons::default())
+}
+
+pub fn inject_with_buttons(ev: &InputEvent, buttons: &mut MouseButtons) -> Result<(), InputError> {
     match ev {
-        InputEvent::MouseMoveAbs { x, y, .. } => unsafe { cg_mouse_abs(*x, *y) },
-        InputEvent::MouseMoveRel { dx, dy } => unsafe { cg_mouse_rel(*dx, *dy) },
-        InputEvent::MouseButton { button, down } => unsafe { cg_button(*button, *down) },
+        InputEvent::MouseMoveAbs { x, y, .. } => {
+            unsafe { cg_mouse_abs(*x, *y, buttons.drag_button()) }
+        }
+        InputEvent::MouseMoveRel { dx, dy } => unsafe { cg_mouse_rel(*dx, *dy, buttons.drag_button()) },
+        InputEvent::MouseButton { button, down } => {
+            buttons.set_button(*button, *down);
+            unsafe { cg_button(*button, *down) }
+        }
         InputEvent::MouseWheel { dx, dy } => unsafe { cg_wheel(*dx, *dy) },
         InputEvent::Key { vk, down, .. } => unsafe { cg_key(windows_vk_to_cg(*vk), *down) },
     }
@@ -82,22 +118,22 @@ fn ansi_digit(b: u8) -> u16 {
     }
 }
 
-unsafe fn cg_mouse_abs(x: u16, y: u16) -> Result<(), InputError> {
+unsafe fn cg_mouse_abs(x: u16, y: u16, drag_button: i32) -> Result<(), InputError> {
     extern "C" {
-        fn lansec_cg_mouse_abs(x: u16, y: u16) -> i32;
+        fn lansec_cg_mouse_abs(x: u16, y: u16, drag_button: i32) -> i32;
     }
-    if lansec_cg_mouse_abs(x, y) == 0 {
+    if lansec_cg_mouse_abs(x, y, drag_button) == 0 {
         Err(InputError::Message("CGEvent mouse abs failed".into()))
     } else {
         Ok(())
     }
 }
 
-unsafe fn cg_mouse_rel(dx: i16, dy: i16) -> Result<(), InputError> {
+unsafe fn cg_mouse_rel(dx: i16, dy: i16, drag_button: i32) -> Result<(), InputError> {
     extern "C" {
-        fn lansec_cg_mouse_rel(dx: i16, dy: i16) -> i32;
+        fn lansec_cg_mouse_rel(dx: i16, dy: i16, drag_button: i32) -> i32;
     }
-    if lansec_cg_mouse_rel(dx, dy) == 0 {
+    if lansec_cg_mouse_rel(dx, dy, drag_button) == 0 {
         Err(InputError::Message("CGEvent mouse rel failed".into()))
     } else {
         Ok(())

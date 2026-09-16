@@ -6,6 +6,14 @@ pub enum InputError {
     Message(String),
 }
 
+#[cfg(target_os = "macos")]
+pub use macos::MouseButtons;
+
+#[cfg(target_os = "macos")]
+pub fn inject_with_buttons(ev: &InputEvent, buttons: &mut MouseButtons) -> Result<(), InputError> {
+    macos::inject_with_buttons(ev, buttons)
+}
+
 pub fn inject(ev: &InputEvent) -> Result<(), InputError> {
     #[cfg(windows)]
     {

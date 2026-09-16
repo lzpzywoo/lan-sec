@@ -27,7 +27,7 @@ impl CongestionController {
         Self {
             // Desktop text on a LAN: enough bits for sharp P-frames, cap peaks.
             target_bps: 40_000_000,
-            min_bps: 20_000_000,
+            min_bps: 30_000_000,
             max_bps: 80_000_000,
             rtt_us_ewma: 1_000.0,
             loss_ppm_ewma: 0.0,

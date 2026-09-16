@@ -74,6 +74,8 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         last_video_at: None,
         last_idr_req: None,
         video_q: VecDeque::new(),
+        last_presented: None,
+        last_represent: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -113,6 +115,8 @@ struct ClientApp {
     last_video_at: Option<Instant>,
     last_idr_req: Option<Instant>,
     video_q: VecDeque<VideoAccessUnit>,
+    last_presented: Option<lansec_decode::DecodedFrame>,
+    last_represent: Instant,
 }
 
 impl ClientApp {
@@ -169,7 +173,14 @@ impl ClientApp {
                     }
                     Ok(ControlMsg::CapsAccept { format: fmt }) => {
                         info!(chroma = fmt.chroma_label(), width = fmt.width, height = fmt.height, "negotiated");
-                        println!("stream format: {}", fmt.chroma_label());
+                        if fmt.chroma == lansec_protocol::Chroma::Yuv420 {
+                            println!(
+                                "stream format: {} (4:2:0 — text edges chroma-subsampled)",
+                                fmt.chroma_label()
+                            );
+                        } else {
+                            println!("stream format: {}", fmt.chroma_label());
+                        }
                         self.host_w = fmt.width.max(1);
                         self.host_h = fmt.height.max(1);
                         self.open_decoder(fmt.chroma, fmt.width as u32, fmt.height as u32);
@@ -206,7 +217,8 @@ impl ClientApp {
                 Incoming::Datagram { .. } => {}
             }
         }
-        if self.video_q.len() > 8 {
+        const VIDEO_Q_MAX: usize = 3;
+        if self.video_q.len() > VIDEO_Q_MAX {
             if let Some(i) = self.video_q.iter().rposition(|au| au.is_keyframe) {
                 self.video_q.drain(0..i);
             } else {
@@ -214,7 +226,12 @@ impl ClientApp {
                 self.request_idr();
             }
         }
-        if let Some(mut au) = self.video_q.pop_front() {
+        if self.video_q.len() > 1 {
+            while self.video_q.len() > 1 {
+                self.video_q.pop_front();
+            }
+        }
+        if let Some(mut au) = self.video_q.pop_back() {
             self.on_video(&mut au);
         }
         self.win_pump_max_us = self.win_pump_max_us.max(t0.elapsed().as_micros() as u64);
@@ -403,7 +420,7 @@ impl ClientApp {
         self.win_gap_max_us = 0;
     }
 
-    fn present_frame(&mut self, frame: lansec_decode::DecodedFrame) {
+    fn present_frame_ref(&self, frame: &lansec_decode::DecodedFrame) {
         #[cfg(windows)]
         if let (Some(swap), Some(tex)) = (self.swap.as_ref(), frame.d3d11_texture()) {
             if let Err(e) = swap.blit_and_present(tex) {
@@ -416,7 +433,22 @@ impl ClientApp {
                 warn!("present: {e}");
             }
         }
-        let _ = frame;
+    }
+
+    fn present_frame(&mut self, frame: lansec_decode::DecodedFrame) {
+        self.present_frame_ref(&frame);
+        self.last_presented = Some(frame);
+    }
+
+    fn represent_last_if_due(&mut self) {
+        const INTERVAL: Duration = Duration::from_nanos(16_666_667);
+        if self.last_presented.is_none() || self.last_represent.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_represent = Instant::now();
+        if let Some(frame) = self.last_presented.as_ref() {
+            self.present_frame_ref(frame);
+        }
     }
 
     fn ensure_present_targets(&mut self) {
@@ -548,6 +580,7 @@ impl ApplicationHandler for ClientApp {
         event_loop.set_control_flow(ControlFlow::Poll);
         self.ensure_present_targets();
         self.pump();
+        self.represent_last_if_due();
         self.maybe_log_stats();
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();

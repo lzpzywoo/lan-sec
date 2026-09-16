@@ -200,6 +200,7 @@ impl DxgiCapture {
                 height: self.height,
                 capture_us: self.origin.elapsed().as_micros() as u64,
                 fresh: true,
+                content_gen: 0,
             },
             inner: GpuFrameInner::D3d11(D3d11Frame {
                 texture: self.owned.clone(),
@@ -214,6 +215,7 @@ impl DxgiCapture {
                 height: self.height,
                 capture_us: self.origin.elapsed().as_micros() as u64,
                 fresh: false,
+                content_gen: 0,
             },
             inner: GpuFrameInner::D3d11(D3d11Frame {
                 texture: self.owned.clone(),

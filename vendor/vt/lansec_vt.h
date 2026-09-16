@@ -17,13 +17,14 @@ int lansec_vt_dec_decode(void *session, const uint8_t *data, int len, void **pix
 
 void *lansec_sck_start(uint32_t *width, uint32_t *height);
 void lansec_sck_stop(void *cap);
-void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh);
+void *lansec_sck_next(void *cap, uint64_t *capture_us, int *fresh, uint64_t *content_gen);
 int lansec_sck_next_audio(void *cap, float *out, int cap_samples);
 void lansec_cf_release(void *obj);
 
 int lansec_vt_probe_decode_444(void);
-int lansec_cg_mouse_abs(uint16_t x, uint16_t y);
-int lansec_cg_mouse_rel(int16_t dx, int16_t dy);
+/// drag_button: -1 move, 0 left drag, 1 right drag, 2 other/middle drag
+int lansec_cg_mouse_abs(uint16_t x, uint16_t y, int drag_button);
+int lansec_cg_mouse_rel(int16_t dx, int16_t dy, int drag_button);
 int lansec_cg_button(uint8_t button, int down);
 int lansec_cg_wheel(int16_t dx, int16_t dy);
 int lansec_cg_key(uint16_t vk, int down);

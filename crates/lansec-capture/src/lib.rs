@@ -20,6 +20,8 @@ pub struct FrameInfo {
     pub capture_us: u64,
     /// False when this is a re-encode of the last desktop surface (no SCK/DXGI update).
     pub fresh: bool,
+    /// Monotonic counter bumped only when capture reports new pixels (SCK non-idle).
+    pub content_gen: u64,
 }
 
 pub struct GpuFrame {
