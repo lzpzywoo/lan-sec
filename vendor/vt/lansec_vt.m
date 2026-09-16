@@ -27,14 +27,19 @@
 #ifndef kVTQPModulationLevel_Disable
 #define kVTQPModulationLevel_Disable 0
 #endif
+// macOS 13+; resolve at runtime so older SDKs still compile.
+#ifndef kVTCompressionPropertyKey_ConstantBitRate
+#define kVTCompressionPropertyKey_ConstantBitRate CFSTR("ConstantBitRate")
+#endif
 
-// High quality floor for desktop/text. AverageBitRate alone is only a soft ceiling under
-// low-latency VBR — the encoder can look sharp-but-blurry at 1 Mbps while target is 40 Mbps.
-static const float kLansecVtQuality = 0.88f;
+// High quality floor for ABR fallback. Under CBR this is unused — ConstantBitRate
+// pads low-motion frames so LAN desktop text stays sharp near the target Mbps.
+static const float kLansecVtQuality = 0.95f;
 
 typedef struct {
     VTCompressionSessionRef session;
     uint32_t bitrate;
+    int use_cbr;
     NSMutableData *pending;
     int pending_key;
     dispatch_semaphore_t sem;
@@ -243,23 +248,49 @@ static void vt_set_data_rate_limits(VTCompressionSessionRef s, uint32_t bitrate)
     CFRelease(bps);
 }
 
-static void vt_apply_rate_control(VTCompressionSessionRef s, uint32_t bitrate) {
-    if (!s || !bitrate) return;
+// Prefer ConstantBitRate (macOS 13+ Apple Silicon): fills the target even on static
+// desktops. AverageBitRate alone is a soft ceiling under low-latency VBR and stays
+// at 1–8 Mbps for text/UI even when target is 40 Mbps.
+static int vt_try_cbr(VTCompressionSessionRef s, uint32_t bitrate) {
+    if (!s || !bitrate) return 0;
+    CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
+    if (!br) return 0;
+    OSStatus st = VTSessionSetProperty(s, kVTCompressionPropertyKey_ConstantBitRate, br);
+    CFRelease(br);
+    return st == noErr ? 1 : 0;
+}
+
+static void vt_apply_rate_control(VtEnc *e, uint32_t bitrate) {
+    if (!e || !e->session || !bitrate) return;
+    e->bitrate = bitrate;
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanFalse);
+
+    if (e->use_cbr || vt_try_cbr(e->session, bitrate)) {
+        e->use_cbr = 1;
+        // CBR is incompatible with AverageBitRate / DataRateLimits / Quality.
+        return;
+    }
+
+    e->use_cbr = 0;
     float quality = kLansecVtQuality;
     CFNumberRef q = CFNumberCreate(NULL, kCFNumberFloatType, &quality);
     if (q) {
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_Quality, q);
+        VTSessionSetProperty(e->session, kVTCompressionPropertyKey_Quality, q);
         CFRelease(q);
     }
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanFalse);
     CFNumberRef br = CFNumberCreate(NULL, kCFNumberSInt32Type, &bitrate);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, br);
-    CFRelease(br);
-    vt_set_data_rate_limits(s, bitrate);
+    if (br) {
+        VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, br);
+        CFRelease(br);
+    }
+    // Peak cap above average so ABR can burst toward the floor we want.
+    uint32_t peak = bitrate + bitrate / 2;
+    if (peak < bitrate) peak = bitrate;
+    vt_set_data_rate_limits(e->session, peak);
     int spatial = kVTQPModulationLevel_Disable;
     CFNumberRef sap = CFNumberCreate(NULL, kCFNumberIntType, &spatial);
     if (sap) {
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_SpatialAdaptiveQPLevel, sap);
+        VTSessionSetProperty(e->session, kVTCompressionPropertyKey_SpatialAdaptiveQPLevel, sap);
         CFRelease(sap);
     }
 }
@@ -268,6 +299,7 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     VtEnc *e = calloc(1, sizeof(VtEnc));
     if (!e) return NULL;
     e->bitrate = bitrate ? bitrate : 40000000;
+    e->use_cbr = 0;
     e->pending = [NSMutableData data];
     e->sem = dispatch_semaphore_create(0);
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -295,7 +327,6 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     CFNumberRef kgopd = CFNumberCreate(NULL, kCFNumberDoubleType, &gop_s);
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kgopd);
     CFRelease(kgopd);
-    vt_apply_rate_control(e->session, e->bitrate);
     if (yuv444) {
         if (VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main444_AutoLevel) != noErr) {
             lansec_vt_close(e);
@@ -303,6 +334,12 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
         }
     } else {
         VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+    }
+    vt_apply_rate_control(e, e->bitrate);
+    if (e->use_cbr) {
+        fprintf(stderr, "vt-enc: ConstantBitRate=%u bps (fills target on static desktop)\n", e->bitrate);
+    } else {
+        fprintf(stderr, "vt-enc: AverageBitRate=%u bps (CBR unsupported; ABR+Quality fallback)\n", e->bitrate);
     }
     VTCompressionSessionPrepareToEncodeFrames(e->session);
     return e;
@@ -322,8 +359,7 @@ void lansec_vt_close(void *session) {
 void lansec_vt_set_bitrate(void *session, uint32_t bitrate) {
     VtEnc *e = (VtEnc *)session;
     if (!e || !e->session || !bitrate) return;
-    e->bitrate = bitrate;
-    vt_apply_rate_control(e->session, bitrate);
+    vt_apply_rate_control(e, bitrate);
 }
 
 int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *out, int cap, int *len, int *key) {
@@ -643,6 +679,9 @@ int lansec_cg_mouse_abs(uint16_t x, uint16_t y, int drag_button) {
     }
     CGEventRef e = CGEventCreateMouseEvent(NULL, type, CGPointMake(x, y), b);
     if (!e) return 0;
+    if (drag_button >= 0) {
+        CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
+    }
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
     return 1;
@@ -655,19 +694,27 @@ int lansec_cg_mouse_rel(int16_t dx, int16_t dy, int drag_button) {
     return lansec_cg_mouse_abs((uint16_t)(p.x + dx), (uint16_t)(p.y + dy), drag_button);
 }
 
-int lansec_cg_button(uint8_t button, int down) {
+int lansec_cg_button(uint8_t button, int down, uint16_t x, uint16_t y) {
     CGEventType type = kCGEventLeftMouseDown;
     CGMouseButton b = kCGMouseButtonLeft;
     if (button == 0) { type = down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp; b = kCGMouseButtonLeft; }
     else if (button == 1) { type = down ? kCGEventRightMouseDown : kCGEventRightMouseUp; b = kCGMouseButtonRight; }
     else { type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; b = kCGMouseButtonCenter; }
-    CGEventRef loc = CGEventCreate(NULL);
-    CGPoint p = CGEventGetLocation(loc);
-    CFRelease(loc);
-    CGEventRef e = CGEventCreateMouseEvent(NULL, type, p, b);
+    CGEventRef e = CGEventCreateMouseEvent(NULL, type, CGPointMake(x, y), b);
     if (!e) return 0;
+    CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    return 1;
+}
+
+int lansec_cg_cursor_pos(uint16_t *x, uint16_t *y) {
+    CGEventRef loc = CGEventCreate(NULL);
+    if (!loc) return 0;
+    CGPoint p = CGEventGetLocation(loc);
+    CFRelease(loc);
+    if (x) *x = (uint16_t)p.x;
+    if (y) *y = (uint16_t)p.y;
     return 1;
 }
 

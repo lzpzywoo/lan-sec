@@ -340,6 +340,8 @@ fn net_loop(
     bitrate: Arc<AtomicU32>,
     input_count: Arc<AtomicU32>,
 ) {
+    #[cfg(target_os = "macos")]
+    let mut mouse_buttons = MouseButtons::default();
     loop {
         if bye.load(Ordering::Relaxed) {
             return;
@@ -350,9 +352,13 @@ fn net_loop(
             continue;
         }
         let idle = incoming.is_empty();
-        let mut last_move = None;
+        // While a button is held, every move must be injected as LeftMouseDragged.
+        // Coalescing here made window drags "teleport" on mouse-up.
         #[cfg(target_os = "macos")]
-        let mut mouse_buttons = MouseButtons::default();
+        let coalesce_moves = !mouse_buttons.any_down();
+        #[cfg(not(target_os = "macos"))]
+        let coalesce_moves = true;
+        let mut last_move = None;
         for msg in incoming {
             match msg {
                 Incoming::Established { peer } => {
@@ -399,7 +405,15 @@ fn net_loop(
                 } => {
                     if let Ok(ev) = decode::<InputEvent>(&payload) {
                         if matches!(ev, InputEvent::MouseMoveAbs { .. } | InputEvent::MouseMoveRel { .. }) {
-                            last_move = Some(ev);
+                            if coalesce_moves {
+                                last_move = Some(ev);
+                            } else {
+                                #[cfg(target_os = "macos")]
+                                let _ = inject_with_buttons(&ev, &mut mouse_buttons);
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = inject(&ev);
+                                input_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         } else {
                             if let Some(mv) = last_move.take() {
                                 #[cfg(target_os = "macos")]
