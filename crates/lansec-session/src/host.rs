@@ -158,8 +158,10 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     let mut last_content_at = Instant::now() - Duration::from_secs(1);
     const TARGET_FPS: u32 = 60;
     const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS as u64);
-    const MOTION_BOOST_BPS: u32 = 80_000_000;
-    const MOTION_IDLE: Duration = Duration::from_millis(500);
+    const MOTION_BOOST_BPS: u32 = 100_000_000;
+    const MOTION_IDLE: Duration = Duration::from_millis(300);
+    // Keep encoding briefly after last content change so CBR/ABR averages do not collapse.
+    const MOTION_HOLD: Duration = Duration::from_millis(200);
     #[cfg(windows)]
     let mut loopback = lansec_audio::wasapi::Loopback::open().ok();
 
@@ -246,9 +248,13 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
             let mut encoded = false;
             if let (Some(cap), Some(enc)) = (capture.as_mut(), encoder.as_mut()) {
                 if let Ok(Some(frame)) = cap.next_frame() {
-                    // Re-encoding duplicate SCK frames makes tiny P-frames that flicker
-                    // against periodic IDRs. Only encode when ScreenCaptureKit reports new pixels.
-                    let due = frame.info.fresh || force_idr;
+                    if frame.info.fresh {
+                        last_content_at = Instant::now();
+                    }
+                    // Encode on content change, IDR, or briefly after motion so bitrate
+                    // does not collapse between SCK idle frames during a drag.
+                    let in_motion = last_content_at.elapsed() < MOTION_HOLD;
+                    let due = frame.info.fresh || force_idr || in_motion;
                     if !due {
                         if last_encode.elapsed() >= FRAME_INTERVAL {
                             stats.repeat += 1;
@@ -260,7 +266,8 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                     } else {
                         if frame.info.fresh {
                             stats.fresh += 1;
-                            last_content_at = Instant::now();
+                        } else {
+                            stats.repeat += 1;
                         }
                         let t_enc = Instant::now();
                         match enc.encode(&frame, force_idr) {

@@ -116,16 +116,8 @@ impl NegotiatedFormat {
 }
 
 /// Prefer HEVC 4:4:4 8-bit, then HEVC 4:2:0. Intersection of host encode and client decode.
-///
-/// Mac host → Windows client stays on 4:2:0 for now. Intel D3D11VA advertises HEVC
-/// Main 4:4:4, but VideoToolbox Main 4:4:4 bitstreams present as a white frame
-/// (mouse/keyboard still work). Windows host → Mac client remains the 4:4:4 path.
 pub fn negotiate(host: &Caps, client: &Caps) -> Option<NegotiatedFormat> {
-    let order: &[Chroma] = if host.platform == Platform::Macos && client.platform == Platform::Windows {
-        &[Chroma::Yuv420, Chroma::Yuv444]
-    } else {
-        &[Chroma::Yuv444, Chroma::Yuv420]
-    };
+    let order: &[Chroma] = &[Chroma::Yuv444, Chroma::Yuv420];
     for chroma in order.iter().copied() {
         for enc in host
             .encode
@@ -183,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn mac_host_windows_client_prefers_420() {
+    fn mac_host_windows_client_prefers_444() {
         let host = Caps {
             encode: vec![
                 CodecCap::encode(EncodeBackend::VideoToolbox, Chroma::Yuv444, 2560, 1600),
@@ -205,7 +197,7 @@ mod tests {
             platform: Platform::Windows,
         };
         let fmt = negotiate(&host, &client).unwrap();
-        assert_eq!(fmt.chroma, Chroma::Yuv420);
+        assert_eq!(fmt.chroma, Chroma::Yuv444);
         assert_eq!(fmt.encode, EncodeBackend::VideoToolbox);
         assert_eq!(fmt.decode, DecodeBackend::D3d11va);
     }

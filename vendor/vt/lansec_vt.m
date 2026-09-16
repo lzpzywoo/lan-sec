@@ -40,6 +40,7 @@ typedef struct {
     VTCompressionSessionRef session;
     uint32_t bitrate;
     int use_cbr;
+    int64_t frame_index;
     NSMutableData *pending;
     int pending_key;
     dispatch_semaphore_t sem;
@@ -298,13 +299,14 @@ static void vt_apply_rate_control(VtEnc *e, uint32_t bitrate) {
 void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv444) {
     VtEnc *e = calloc(1, sizeof(VtEnc));
     if (!e) return NULL;
-    e->bitrate = bitrate ? bitrate : 40000000;
+    e->bitrate = bitrate ? bitrate : 50000000;
     e->use_cbr = 0;
     e->pending = [NSMutableData data];
     e->sem = dispatch_semaphore_create(0);
-    CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // Do NOT enable EnableLowLatencyRateControl: it fights ConstantBitRate and
+    // keeps desktop encodes at 1–8 Mbps under AverageBitRate.
+    CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
-    CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)width, (int32_t)height, kCMVideoCodecType_HEVC,
                                              spec, NULL, NULL, on_encoded, e, &e->session);
     CFRelease(spec);
@@ -317,6 +319,7 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     CFRelease(dly);
     int fps = 60;
     CFNumberRef efps = CFNumberCreate(NULL, kCFNumberIntType, &fps);
+    // Required for effective CBR; also guides ABR.
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate, efps);
     CFRelease(efps);
     int gop = 240;
@@ -337,9 +340,9 @@ void *lansec_vt_open(uint32_t width, uint32_t height, uint32_t bitrate, int yuv4
     }
     vt_apply_rate_control(e, e->bitrate);
     if (e->use_cbr) {
-        fprintf(stderr, "vt-enc: ConstantBitRate=%u bps (fills target on static desktop)\n", e->bitrate);
+        fprintf(stderr, "vt-enc: ConstantBitRate=%u bps (no low-latency RC)\n", e->bitrate);
     } else {
-        fprintf(stderr, "vt-enc: AverageBitRate=%u bps (CBR unsupported; ABR+Quality fallback)\n", e->bitrate);
+        fprintf(stderr, "vt-enc: AverageBitRate=%u bps Quality=0.95 (CBR unsupported; ABR no-LLRC)\n", e->bitrate);
     }
     VTCompressionSessionPrepareToEncodeFrames(e->session);
     return e;
@@ -365,7 +368,11 @@ void lansec_vt_set_bitrate(void *session, uint32_t bitrate) {
 int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *out, int cap, int *len, int *key) {
     VtEnc *e = (VtEnc *)session;
     if (!e || !pixel_buffer || !out || !len) return 0;
-    CMTime pts = CMTimeMake((int64_t)now_us(), 1000000);
+    // CBR/ABR need a stable PTS cadence matching ExpectedFrameRate (60).
+    // Wall-clock PTS + invalid duration made ConstantBitRate under-fill to ~few Mbps.
+    int64_t idx = e->frame_index++;
+    CMTime pts = CMTimeMake(idx, 60);
+    CMTime dur = CMTimeMake(1, 60);
     CFMutableDictionaryRef props = NULL;
     if (force_idr) {
         props = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -378,7 +385,7 @@ int lansec_vt_encode(void *session, void *pixel_buffer, int force_idr, uint8_t *
         [e->pending setLength:0];
         e->pending_key = 0;
     }
-    OSStatus st = VTCompressionSessionEncodeFrame(e->session, (CVPixelBufferRef)pixel_buffer, pts, kCMTimeInvalid, props, NULL, NULL);
+    OSStatus st = VTCompressionSessionEncodeFrame(e->session, (CVPixelBufferRef)pixel_buffer, pts, dur, props, NULL, NULL);
     if (props) CFRelease(props);
     if (st != noErr) return 0;
     // Encode is typically ~8ms; the wait must outlast that. Timing out at 8ms

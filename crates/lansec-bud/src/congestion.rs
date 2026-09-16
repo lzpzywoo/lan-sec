@@ -25,10 +25,10 @@ pub struct CongestionStats {
 impl CongestionController {
     pub fn lan_default() -> Self {
         Self {
-            // Desktop text on a LAN: enough bits for sharp P-frames, cap peaks.
-            target_bps: 40_000_000,
-            min_bps: 30_000_000,
-            max_bps: 80_000_000,
+            // Desktop text on a LAN: fill the pipe so VT CBR/ABR stays sharp.
+            target_bps: 50_000_000,
+            min_bps: 40_000_000,
+            max_bps: 100_000_000,
             rtt_us_ewma: 1_000.0,
             loss_ppm_ewma: 0.0,
             in_flight_bytes: 0,

@@ -11,8 +11,9 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
     ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -398,15 +399,30 @@ unsafe fn open_inner(
     if let Ok(mt) = gpu.device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);
     }
+    // 4:4:4: prefer HW-MFT → ARGB32 (skip AYUV→BGRA VP, the white-screen path on Intel).
+    // Fall back to DXVA/MFX + Video Processor CSC only if MFT open fails.
     if chroma == Chroma::Yuv444 {
+        match open_mf_hevc(gpu, chroma, width, height) {
+            Ok(dec) => return Ok(dec),
+            Err(e) => warn!("HW-MFT HEVC 4:4:4 open failed ({e}); trying D3D11VA/MFX"),
+        }
         if let Some(dec) = open_dxva(gpu, width, height) {
             return Ok(dec);
         }
         if let Some(dec) = open_mfx(gpu, width, height) {
             return Ok(dec);
         }
-        warn!("D3D11VA/MFX HEVC 4:4:4 decoder unavailable; trying hardware MFT");
+        return Err(windows::core::Error::from(E_FAIL));
     }
+    open_mf_hevc(gpu, chroma, width, height)
+}
+
+unsafe fn open_mf_hevc(
+    gpu: &GpuContext,
+    chroma: Chroma,
+    width: u32,
+    height: u32,
+) -> windows::core::Result<Box<dyn HardwareDecoder>> {
     let mut reset_token = 0u32;
     let mut manager: Option<IMFDXGIDeviceManager> = None;
     MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)?;
@@ -441,12 +457,13 @@ unsafe fn open_inner(
     input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     transform.SetInputType(0, &input, 0)?;
 
+    // 444: ARGB32 first so present can skip Video Processor CSC (Intel AYUV VP → white).
     let prefer: &[GUID] = if chroma == Chroma::Yuv444 {
-        &[MFVideoFormat_AYUV, MFVideoFormat_ARGB32]
+        &[MFVideoFormat_ARGB32, MFVideoFormat_AYUV]
     } else {
         &[MFVideoFormat_NV12, MFVideoFormat_AYUV]
     };
-    set_output_type(&transform, width, height, prefer, chroma != Chroma::Yuv444)?;
+    let out_label = set_output_type(&transform, width, height, prefer, chroma != Chroma::Yuv444)?;
 
     transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
     transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -459,6 +476,7 @@ unsafe fn open_inner(
     } else {
         None
     };
+    let csc = VideoCsc::try_new(&gpu.device, &gpu.context, width, height).ok();
     info!(
         %name,
         ?chroma,
@@ -466,9 +484,15 @@ unsafe fn open_inner(
         height,
         provides,
         async_hw,
+        output = out_label,
+        csc = csc.is_some(),
         input_cb = in_info.cbSize,
         input_align = in_info.cbAlignment,
         "MF HEVC decoder (D3D11) ready"
+    );
+    println!(
+        "hevc-decode backend=HW-MFT name={name} chroma={chroma:?} output={out_label} csc={}",
+        csc.is_some()
     );
 
     Ok(Box::new(MfDecoder {
@@ -488,8 +512,9 @@ unsafe fn open_inner(
         min_input: in_info.cbSize,
         input_align: in_info.cbAlignment,
         origin: Instant::now(),
-        csc: VideoCsc::try_new(&gpu.device, &gpu.context, width, height).ok(),
+        csc,
         sample_clock: 0,
+        diag_frames: 0,
     }))
 }
 
@@ -499,7 +524,7 @@ unsafe fn set_output_type(
     height: u32,
     prefer: &[GUID],
     fallback: bool,
-) -> windows::core::Result<()> {
+) -> windows::core::Result<&'static str> {
     for want in prefer {
         for i in 0..32u32 {
             let Ok(ty) = transform.GetOutputAvailableType(0, i) else {
@@ -511,23 +536,91 @@ unsafe fn set_output_type(
             }
             let _ = ty.SetUINT64(&MF_MT_FRAME_SIZE, pack_wh(width.max(1), height.max(1)));
             if transform.SetOutputType(0, &ty, 0).is_ok() {
-                return Ok(());
+                return Ok(mf_subtype_label(*want));
             }
         }
     }
     if fallback {
         if let Ok(ty) = transform.GetOutputAvailableType(0, 0) {
             transform.SetOutputType(0, &ty, 0)?;
-            return Ok(());
+            let sub = ty.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+            return Ok(mf_subtype_label(sub));
         }
     }
     Err(windows::core::Error::from(E_FAIL))
 }
 
+fn mf_subtype_label(g: GUID) -> &'static str {
+    if g == MFVideoFormat_ARGB32 {
+        "ARGB32"
+    } else if g == MFVideoFormat_AYUV {
+        "AYUV"
+    } else if g == MFVideoFormat_NV12 {
+        "NV12"
+    } else {
+        "other"
+    }
+}
+
+fn dxgi_format_label(f: DXGI_FORMAT) -> &'static str {
+    match f {
+        DXGI_FORMAT_B8G8R8A8_UNORM => "BGRA8",
+        DXGI_FORMAT_AYUV => "AYUV",
+        _ => "other",
+    }
+}
+
+/// Read a few BGRA samples from a texture to detect all-0 / all-255 (white screen).
+unsafe fn probe_bgra_nonzero(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+) -> Option<(u8, u8, u8, u8, bool)> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.Width == 0 || desc.Height == 0 {
+        return None;
+    }
+    let mut sd = D3D11_TEXTURE2D_DESC::default();
+    sd.Width = 1;
+    sd.Height = 1;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+    let mut staging = None;
+    device.CreateTexture2D(&sd, None, Some(&mut staging)).ok()?;
+    let staging = staging?;
+    let src: ID3D11Resource = tex.cast().ok()?;
+    let dst: ID3D11Resource = staging.cast().ok()?;
+    // Center pixel — desktop content almost never pure white/black there if decode works.
+    let x = desc.Width / 2;
+    let y = desc.Height / 2;
+    ctx.CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, 0, Some(&windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+        left: x,
+        top: y,
+        front: 0,
+        right: x + 1,
+        bottom: y + 1,
+        back: 1,
+    }));
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    ctx.Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+    let p = mapped.pData as *const u8;
+    let (b, g, r, a) = if p.is_null() {
+        (0, 0, 0, 0)
+    } else {
+        (*p, *p.add(1), *p.add(2), *p.add(3))
+    };
+    ctx.Unmap(&dst, 0);
+    let empty = (b == 0 && g == 0 && r == 0) || (b == 255 && g == 255 && r == 255);
+    Some((b, g, r, a, !empty))
+}
+
 struct GpuHolder {
-    #[allow(dead_code)]
     device: ID3D11Device,
-    #[allow(dead_code)]
     context: ID3D11DeviceContext,
 }
 
@@ -557,6 +650,15 @@ impl VideoCsc {
             let enumerator = video.CreateVideoProcessorEnumerator(&desc)?;
             let processor = video.CreateVideoProcessor(&enumerator, 0)?;
             vctx.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+            // Desktop capture is full-range; video-range CSC often washes AYUV to white/near-white.
+            // Bit layout: Usage:1, RGB_Range:1, YCbCr_Matrix:1, YCbCr_xvYCC:1, Nominal_Range:2
+            // YCbCr_Matrix=1 (BT.709), Nominal_Range=1 (0–255).
+            let stream_bits: u32 = (1 << 2) | (1 << 4);
+            let stream_cs: D3D11_VIDEO_PROCESSOR_COLOR_SPACE = std::mem::transmute(stream_bits);
+            vctx.VideoProcessorSetStreamColorSpace(&processor, 0, &stream_cs);
+            let out_bits: u32 = 1 << 4; // full-range RGB
+            let out_cs: D3D11_VIDEO_PROCESSOR_COLOR_SPACE = std::mem::transmute(out_bits);
+            vctx.VideoProcessorSetOutputColorSpace(&processor, &out_cs);
             let mut td = D3D11_TEXTURE2D_DESC::default();
             td.Width = width.max(1);
             td.Height = height.max(1);
@@ -626,12 +728,20 @@ fn open_dxva(gpu: &GpuContext, width: u32, height: u32) -> Option<Box<dyn Hardwa
         return None;
     }
     info!(width, height, "D3D11VA HEVC 4:4:4 decoder ready");
+    let csc = VideoCsc::try_new(&gpu.device, &gpu.context, width.max(1), height.max(1)).ok();
+    println!(
+        "hevc-decode backend=DXVA chroma=Yuv444 output=AYUV csc={}",
+        csc.is_some()
+    );
     Some(Box::new(DxvaDecoder {
         ptr,
         width: width.max(1),
         height: height.max(1),
         origin: Instant::now(),
-        csc: VideoCsc::try_new(&gpu.device, &gpu.context, width.max(1), height.max(1)).ok(),
+        csc,
+        device: gpu.device.clone(),
+        context: gpu.context.clone(),
+        diag_frames: 0,
     }))
 }
 
@@ -641,6 +751,9 @@ struct DxvaDecoder {
     height: u32,
     origin: Instant,
     csc: Option<VideoCsc>,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    diag_frames: u32,
 }
 
 unsafe impl Send for DxvaDecoder {}
@@ -671,6 +784,8 @@ impl HardwareDecoder for DxvaDecoder {
             return Ok(None);
         }
         let tex = unsafe { ID3D11Texture2D::from_raw(raw as *mut _) };
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut src_desc) };
         let tex = if let Some(csc) = self.csc.as_ref() {
             match csc.convert(&tex, 0) {
                 Ok(bgra) => bgra,
@@ -682,6 +797,26 @@ impl HardwareDecoder for DxvaDecoder {
         } else {
             tex
         };
+        if self.diag_frames < 3 {
+            self.diag_frames += 1;
+            let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut out_desc) };
+            let probe = unsafe { probe_bgra_nonzero(&self.device, &self.context, &tex) };
+            info!(
+                frame = self.diag_frames,
+                src = dxgi_format_label(src_desc.Format),
+                out = dxgi_format_label(out_desc.Format),
+                probe = ?probe,
+                "444 DXVA frame diag"
+            );
+            println!(
+                "444-dxva diag frame={} src={} out={} probe={:?}",
+                self.diag_frames,
+                dxgi_format_label(src_desc.Format),
+                dxgi_format_label(out_desc.Format),
+                probe
+            );
+        }
         Ok(Some(DecodedFrame {
             width: self.width,
             height: self.height,
@@ -697,12 +832,20 @@ fn open_mfx(gpu: &GpuContext, width: u32, height: u32) -> Option<Box<dyn Hardwar
         return None;
     }
     info!(width, height, "Intel MFX HEVC 4:4:4 decoder ready");
+    let csc = VideoCsc::try_new(&gpu.device, &gpu.context, width.max(1), height.max(1)).ok();
+    println!(
+        "hevc-decode backend=MFX chroma=Yuv444 output=AYUV csc={}",
+        csc.is_some()
+    );
     Some(Box::new(MfxDecoder {
         ptr,
         width: width.max(1),
         height: height.max(1),
         origin: Instant::now(),
-        csc: VideoCsc::try_new(&gpu.device, &gpu.context, width.max(1), height.max(1)).ok(),
+        csc,
+        device: gpu.device.clone(),
+        context: gpu.context.clone(),
+        diag_frames: 0,
     }))
 }
 
@@ -712,6 +855,9 @@ struct MfxDecoder {
     height: u32,
     origin: Instant,
     csc: Option<VideoCsc>,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    diag_frames: u32,
 }
 
 unsafe impl Send for MfxDecoder {}
@@ -747,6 +893,8 @@ impl HardwareDecoder for MfxDecoder {
             return Ok(None);
         }
         let tex = unsafe { ID3D11Texture2D::from_raw(raw as *mut _) };
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut src_desc) };
         let tex = if let Some(csc) = self.csc.as_ref() {
             match csc.convert(&tex, 0) {
                 Ok(bgra) => bgra,
@@ -758,6 +906,26 @@ impl HardwareDecoder for MfxDecoder {
         } else {
             tex
         };
+        if self.diag_frames < 3 {
+            self.diag_frames += 1;
+            let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut out_desc) };
+            let probe = unsafe { probe_bgra_nonzero(&self.device, &self.context, &tex) };
+            info!(
+                frame = self.diag_frames,
+                src = dxgi_format_label(src_desc.Format),
+                out = dxgi_format_label(out_desc.Format),
+                probe = ?probe,
+                "444 MFX frame diag"
+            );
+            println!(
+                "444-mfx diag frame={} src={} out={} probe={:?}",
+                self.diag_frames,
+                dxgi_format_label(src_desc.Format),
+                dxgi_format_label(out_desc.Format),
+                probe
+            );
+        }
         Ok(Some(DecodedFrame {
             width: self.width,
             height: self.height,
@@ -771,7 +939,6 @@ struct MfDecoder {
     width: u32,
     height: u32,
     chroma: Chroma,
-    #[allow(dead_code)]
     gpu: GpuHolder,
     _manager: IMFDXGIDeviceManager,
     transform: IMFTransform,
@@ -784,6 +951,7 @@ struct MfDecoder {
     origin: Instant,
     csc: Option<VideoCsc>,
     sample_clock: i64,
+    diag_frames: u32,
 }
 
 unsafe impl Send for MfDecoder {}
@@ -920,11 +1088,18 @@ impl MfDecoder {
                     let _ = ManuallyDrop::take(&mut out.pSample);
                     let _ = ManuallyDrop::take(&mut out.pEvents);
                     let prefer: &[GUID] = if self.chroma == Chroma::Yuv444 {
-                        &[MFVideoFormat_AYUV, MFVideoFormat_ARGB32]
+                        &[MFVideoFormat_ARGB32, MFVideoFormat_AYUV]
                     } else {
                         &[MFVideoFormat_NV12, MFVideoFormat_AYUV]
                     };
-                    set_output_type(&self.transform, self.width, self.height, prefer, self.chroma != Chroma::Yuv444)?;
+                    let label = set_output_type(
+                        &self.transform,
+                        self.width,
+                        self.height,
+                        prefer,
+                        self.chroma != Chroma::Yuv444,
+                    )?;
+                    info!(output = label, "MF stream change renegotiated output");
                     let info = self.transform.GetOutputStreamInfo(0)?;
                     self.provides_samples =
                         info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
@@ -958,7 +1133,7 @@ impl MfDecoder {
         Ok(sample)
     }
 
-    unsafe fn sample_to_frame(&self, sample: &IMFSample) -> windows::core::Result<Option<DecodedFrame>> {
+    unsafe fn sample_to_frame(&mut self, sample: &IMFSample) -> windows::core::Result<Option<DecodedFrame>> {
         let buffer = sample.GetBufferByIndex(0)?;
         let tex = match buffer.cast::<IMFDXGIBuffer>() {
             Ok(dxgi) => {
@@ -971,7 +1146,7 @@ impl MfDecoder {
                 let slice = dxgi.GetSubresourceIndex().unwrap_or(0);
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 tex.GetDesc(&mut desc);
-                if desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
+                let tex = if desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
                     tex
                 } else if let Some(csc) = self.csc.as_ref() {
                     match csc.convert(&tex, slice) {
@@ -983,7 +1158,28 @@ impl MfDecoder {
                     }
                 } else {
                     tex
+                };
+                if self.chroma == Chroma::Yuv444 && self.diag_frames < 3 {
+                    self.diag_frames += 1;
+                    let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+                    tex.GetDesc(&mut out_desc);
+                    let probe = probe_bgra_nonzero(&self.gpu.device, &self.gpu.context, &tex);
+                    info!(
+                        frame = self.diag_frames,
+                        src = dxgi_format_label(desc.Format),
+                        out = dxgi_format_label(out_desc.Format),
+                        probe = ?probe,
+                        "444 MF frame diag"
+                    );
+                    println!(
+                        "444-mf diag frame={} src={} out={} probe={:?}",
+                        self.diag_frames,
+                        dxgi_format_label(desc.Format),
+                        dxgi_format_label(out_desc.Format),
+                        probe
+                    );
                 }
+                tex
             }
             Err(_) => return Ok(None),
         };
