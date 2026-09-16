@@ -24,6 +24,19 @@ pub struct BudConfig {
     pub bind: SocketAddr,
     pub pin: String,
     pub is_host: bool,
+    /// Congestion setpoint; `None` uses LAN defaults (50/40/100 Mbps).
+    pub target_bps: Option<u32>,
+    pub min_bps: Option<u32>,
+    pub max_bps: Option<u32>,
+}
+
+impl BudConfig {
+    pub fn congestion(&self) -> CongestionController {
+        match (self.target_bps, self.min_bps, self.max_bps) {
+            (Some(t), Some(min), Some(max)) => CongestionController::from_bps(t, min, max),
+            _ => CongestionController::lan_default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -116,6 +129,7 @@ impl BudEndpoint {
         sock.set_nonblocking(true)?;
         bump_udp_buffers(&sock);
         let is_host = cfg.is_host;
+        let congestion = cfg.congestion();
         Ok(Self {
             sock,
             cfg,
@@ -139,7 +153,7 @@ impl BudEndpoint {
                 decrypt_fails: 0,
                 last_idr_req: None,
             }),
-            congestion: Mutex::new(CongestionController::lan_default()),
+            congestion: Mutex::new(congestion),
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
             pkts_sent: AtomicU64::new(0),
@@ -440,7 +454,7 @@ impl BudEndpoint {
             matches!(hdr.ty, PacketType::Hello) || !was
         };
         if matches!(hdr.ty, PacketType::Hello) && self.cfg.is_host {
-            *self.congestion.lock() = CongestionController::lan_default();
+            *self.congestion.lock() = self.cfg.congestion();
             self.send_hello(from)?;
         }
         if fire_established {
@@ -747,12 +761,18 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             pin: "4242".into(),
             is_host: true,
+            target_bps: None,
+            min_bps: None,
+            max_bps: None,
         })
         .unwrap();
         let b = BudEndpoint::bind(BudConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             pin: "4242".into(),
             is_host: false,
+            target_bps: None,
+            min_bps: None,
+            max_bps: None,
         })
         .unwrap();
         (a, b)
@@ -877,6 +897,9 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             pin: "4242".into(),
             is_host: false,
+            target_bps: None,
+            min_bps: None,
+            max_bps: None,
         })
         .unwrap();
         client2.connect(host_addr).unwrap();

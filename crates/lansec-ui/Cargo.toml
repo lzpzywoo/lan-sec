@@ -1,0 +1,13 @@
+[package]
+name = "lansec-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "egui launcher for lan-sec host/client settings"
+
+[dependencies]
+lansec-session.workspace = true
+lansec-protocol.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+eframe = { version = "0.30", default-features = true }

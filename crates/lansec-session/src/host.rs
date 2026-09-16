@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
@@ -17,7 +16,8 @@ use lansec_input::{inject_with_buttons, MouseButtons};
 #[cfg(not(target_os = "macos"))]
 use lansec_input::inject;
 use lansec_protocol::{
-    decode, encode, Caps, Channel, Chroma, ControlMsg, FrameTimes, InputEvent, NegotiatedFormat, VideoAccessUnit,
+    decode, encode, Caps, Channel, Chroma, ChromaPref, ControlMsg, FrameTimes, InputEvent, NegotiatedFormat,
+    VideoAccessUnit,
 };
 use tracing::{info, warn};
 
@@ -114,17 +114,33 @@ impl HostStats {
     }
 }
 
-pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
+pub fn run_host(cfg: crate::SessionConfig) -> Result<()> {
+    let mut cfg = cfg;
+    cfg.mode = crate::SessionMode::Host;
+    cfg.clamp();
+    let bind = cfg.bind_addr()?;
     let bud = Arc::new(BudEndpoint::bind(BudConfig {
         bind,
-        pin,
+        pin: cfg.pin.clone(),
         is_host: true,
+        target_bps: Some(cfg.target_bps()),
+        min_bps: Some(cfg.min_bps()),
+        max_bps: Some(cfg.max_bps()),
     })?);
-    info!(addr = %bud.local_addr()?, "host listening");
+    info!(
+        addr = %bud.local_addr()?,
+        fps = cfg.target_fps,
+        target_mbps = cfg.target_mbps,
+        min_mbps = cfg.min_mbps,
+        max_mbps = cfg.max_mbps,
+        chroma = ?cfg.chroma,
+        "host listening"
+    );
     eprintln!(
         "host stats every 0.5s — video=HEVC Mbps  udp_tx=socket Mbps  target=setpoint  encode=avg/max  skip=encode miss  fresh/repeat=SCK  wblock=UDP full"
     );
     let local = local_caps();
+    let chroma_pref = cfg.chroma;
     let (tx, rx) = mpsc::channel::<HostCmd>();
     let need_idr = Arc::new(AtomicBool::new(true));
     let bye = Arc::new(AtomicBool::new(false));
@@ -156,9 +172,9 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
     let mut last_bps = 0u32;
     let mut last_encode = Instant::now();
     let mut last_content_at = Instant::now() - Duration::from_secs(1);
-    const TARGET_FPS: u32 = 60;
-    const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS as u64);
-    const MOTION_BOOST_BPS: u32 = 100_000_000;
+    let target_fps = cfg.target_fps.max(1);
+    let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps as u64);
+    let motion_boost_bps = cfg.max_bps();
     const MOTION_IDLE: Duration = Duration::from_millis(300);
     // Keep encoding briefly after last content change so CBR/ABR averages do not collapse.
     const MOTION_HOLD: Duration = Duration::from_millis(200);
@@ -179,7 +195,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                 need_idr.store(true, Ordering::Relaxed);
             }
             Ok(HostCmd::CapsOffer(remote)) => {
-                match negotiate_with_size(&local, &remote, capture.as_ref()) {
+                match negotiate_with_size(&local, &remote, capture.as_ref(), chroma_pref) {
                     Ok(fmt) => {
                         info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
                         if fmt.chroma == Chroma::Yuv420 {
@@ -256,10 +272,10 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                     let in_motion = last_content_at.elapsed() < MOTION_HOLD;
                     let due = frame.info.fresh || force_idr || in_motion;
                     if !due {
-                        if last_encode.elapsed() >= FRAME_INTERVAL {
+                        if last_encode.elapsed() >= frame_interval {
                             stats.repeat += 1;
-                            last_encode += FRAME_INTERVAL;
-                            if last_encode.elapsed() > FRAME_INTERVAL {
+                            last_encode += frame_interval;
+                            if last_encode.elapsed() > frame_interval {
                                 last_encode = Instant::now();
                             }
                         }
@@ -302,7 +318,7 @@ pub fn run_host(bind: SocketAddr, pin: String) -> Result<()> {
                                 stats.video_bytes += video_bytes;
                                 let cong_bps = bitrate.load(Ordering::Relaxed);
                                 let bps = if last_content_at.elapsed() < MOTION_IDLE {
-                                    cong_bps.max(MOTION_BOOST_BPS)
+                                    cong_bps.max(motion_boost_bps)
                                 } else {
                                     cong_bps
                                 };
@@ -457,8 +473,10 @@ fn negotiate_with_size(
     local: &Caps,
     remote: &Caps,
     capture: Option<&CaptureSession>,
+    pref: ChromaPref,
 ) -> Result<NegotiatedFormat> {
-    let mut fmt = lansec_protocol::negotiate(local, remote).ok_or_else(|| anyhow!("no common codec"))?;
+    let mut fmt = lansec_protocol::negotiate_with_pref(local, remote, pref)
+        .ok_or_else(|| anyhow!("no common codec"))?;
     if let Some(cap) = capture {
         let (w, h) = cap.size();
         fmt.width = w as u16;

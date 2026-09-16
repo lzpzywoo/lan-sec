@@ -115,9 +115,48 @@ impl NegotiatedFormat {
     }
 }
 
+/// User preference for chroma negotiation (local override; not on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ChromaPref {
+    /// Keep platform-aware default order (Mac→Win prefers 420 today).
+    #[default]
+    Auto,
+    /// Prefer 4:2:0, then 4:4:4.
+    Yuv420,
+    /// Prefer 4:4:4, then 4:2:0.
+    Yuv444,
+}
+
+impl ChromaPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Yuv420 => "4:2:0",
+            Self::Yuv444 => "4:4:4",
+        }
+    }
+}
+
 /// Prefer HEVC 4:4:4 8-bit, then HEVC 4:2:0. Intersection of host encode and client decode.
+///
+/// Mac host → Windows client stays on 4:2:0 until Intel Main444 present is verified
+/// non-green (ARGB32-as-YUV showed solid green; AYUV CSC still under test).
 pub fn negotiate(host: &Caps, client: &Caps) -> Option<NegotiatedFormat> {
-    let order: &[Chroma] = &[Chroma::Yuv444, Chroma::Yuv420];
+    negotiate_with_pref(host, client, ChromaPref::Auto)
+}
+
+pub fn negotiate_with_pref(host: &Caps, client: &Caps, pref: ChromaPref) -> Option<NegotiatedFormat> {
+    let order: &[Chroma] = match pref {
+        ChromaPref::Yuv420 => &[Chroma::Yuv420, Chroma::Yuv444],
+        ChromaPref::Yuv444 => &[Chroma::Yuv444, Chroma::Yuv420],
+        ChromaPref::Auto => {
+            if host.platform == Platform::Macos && client.platform == Platform::Windows {
+                &[Chroma::Yuv420, Chroma::Yuv444]
+            } else {
+                &[Chroma::Yuv444, Chroma::Yuv420]
+            }
+        }
+    };
     for chroma in order.iter().copied() {
         for enc in host
             .encode
@@ -175,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn mac_host_windows_client_prefers_444() {
+    fn mac_host_windows_client_prefers_420() {
         let host = Caps {
             encode: vec![
                 CodecCap::encode(EncodeBackend::VideoToolbox, Chroma::Yuv444, 2560, 1600),
@@ -197,9 +236,12 @@ mod tests {
             platform: Platform::Windows,
         };
         let fmt = negotiate(&host, &client).unwrap();
-        assert_eq!(fmt.chroma, Chroma::Yuv444);
+        assert_eq!(fmt.chroma, Chroma::Yuv420);
         assert_eq!(fmt.encode, EncodeBackend::VideoToolbox);
         assert_eq!(fmt.decode, DecodeBackend::D3d11va);
+
+        let forced = negotiate_with_pref(&host, &client, ChromaPref::Yuv444).unwrap();
+        assert_eq!(forced.chroma, Chroma::Yuv444);
     }
 
     #[test]

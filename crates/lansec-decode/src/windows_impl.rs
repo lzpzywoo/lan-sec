@@ -457,9 +457,10 @@ unsafe fn open_mf_hevc(
     input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     transform.SetInputType(0, &input, 0)?;
 
-    // 444: ARGB32 first so present can skip Video Processor CSC (Intel AYUV VP → white).
+    // 444: prefer AYUV + Video Processor CSC. Intel HW-MFT "ARGB32" for Main444 often
+    // still carries YUV-ordered bytes in a BGRA-typed surface → solid green on present.
     let prefer: &[GUID] = if chroma == Chroma::Yuv444 {
-        &[MFVideoFormat_ARGB32, MFVideoFormat_AYUV]
+        &[MFVideoFormat_AYUV, MFVideoFormat_ARGB32]
     } else {
         &[MFVideoFormat_NV12, MFVideoFormat_AYUV]
     };
@@ -650,13 +651,13 @@ impl VideoCsc {
             let enumerator = video.CreateVideoProcessorEnumerator(&desc)?;
             let processor = video.CreateVideoProcessor(&enumerator, 0)?;
             vctx.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-            // Desktop capture is full-range; video-range CSC often washes AYUV to white/near-white.
-            // Bit layout: Usage:1, RGB_Range:1, YCbCr_Matrix:1, YCbCr_xvYCC:1, Nominal_Range:2
-            // YCbCr_Matrix=1 (BT.709), Nominal_Range=1 (0–255).
-            let stream_bits: u32 = (1 << 2) | (1 << 4);
+            // Desktop capture is full-range. Nominal_Range values:
+            // 0=undefined, 1=16–235 (studio), 2=0–255 (full). Using 1 was wrong and
+            // paired badly with AYUV→BGRA; ARGB32-as-YUV also reads as green (Y in G).
+            let stream_bits: u32 = (1 << 2) | (2 << 4); // BT.709 + full 0–255
             let stream_cs: D3D11_VIDEO_PROCESSOR_COLOR_SPACE = std::mem::transmute(stream_bits);
             vctx.VideoProcessorSetStreamColorSpace(&processor, 0, &stream_cs);
-            let out_bits: u32 = 1 << 4; // full-range RGB
+            let out_bits: u32 = 2 << 4; // full-range RGB
             let out_cs: D3D11_VIDEO_PROCESSOR_COLOR_SPACE = std::mem::transmute(out_bits);
             vctx.VideoProcessorSetOutputColorSpace(&processor, &out_cs);
             let mut td = D3D11_TEXTURE2D_DESC::default();
@@ -791,11 +792,12 @@ impl HardwareDecoder for DxvaDecoder {
                 Ok(bgra) => bgra,
                 Err(e) => {
                     warn!("video processor CSC failed: {e}");
-                    tex
+                    return Ok(None);
                 }
             }
         } else {
-            tex
+            warn!("DXVA 444 decode has no Video Processor CSC");
+            return Ok(None);
         };
         if self.diag_frames < 3 {
             self.diag_frames += 1;
@@ -900,11 +902,12 @@ impl HardwareDecoder for MfxDecoder {
                 Ok(bgra) => bgra,
                 Err(e) => {
                     warn!("video processor CSC failed: {e}");
-                    tex
+                    return Ok(None);
                 }
             }
         } else {
-            tex
+            warn!("MFX 444 decode has no Video Processor CSC");
+            return Ok(None);
         };
         if self.diag_frames < 3 {
             self.diag_frames += 1;
@@ -1088,7 +1091,7 @@ impl MfDecoder {
                     let _ = ManuallyDrop::take(&mut out.pSample);
                     let _ = ManuallyDrop::take(&mut out.pEvents);
                     let prefer: &[GUID] = if self.chroma == Chroma::Yuv444 {
-                        &[MFVideoFormat_ARGB32, MFVideoFormat_AYUV]
+                        &[MFVideoFormat_AYUV, MFVideoFormat_ARGB32]
                     } else {
                         &[MFVideoFormat_NV12, MFVideoFormat_AYUV]
                     };
@@ -1147,17 +1150,38 @@ impl MfDecoder {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 tex.GetDesc(&mut desc);
                 let tex = if desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
+                    // Intel Main444 sometimes labels YUV bytes as BGRA → green present.
+                    // Probe once; if center looks like Y-in-G (high G, near-zero R/B), run CSC from AYUV instead is impossible — drop frame.
+                    if self.chroma == Chroma::Yuv444 {
+                        if let Some((b, g, r, _a, ok)) =
+                            probe_bgra_nonzero(&self.gpu.device, &self.gpu.context, &tex)
+                        {
+                            let yuv_as_rgb = ok && g > 40 && r < 20 && b < 20;
+                            if yuv_as_rgb {
+                                warn!(
+                                    b, g, r,
+                                    "444 BGRA looks like YUV-as-RGB (green); dropping frame"
+                                );
+                                return Ok(None);
+                            }
+                        }
+                    }
                     tex
                 } else if let Some(csc) = self.csc.as_ref() {
                     match csc.convert(&tex, slice) {
                         Ok(bgra) => bgra,
                         Err(e) => {
                             warn!("video processor CSC failed: {e}");
-                            tex
+                            // Never present AYUV/NV12 as BGRA — that shows solid green.
+                            return Ok(None);
                         }
                     }
                 } else {
-                    tex
+                    warn!(
+                        format = dxgi_format_label(desc.Format),
+                        "no CSC for non-BGRA decode output"
+                    );
+                    return Ok(None);
                 };
                 if self.chroma == Chroma::Yuv444 && self.diag_frames < 3 {
                     self.diag_frames += 1;

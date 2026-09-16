@@ -5,10 +5,12 @@ use lansec_protocol::{Caps, Chroma, Platform};
 use tracing::info;
 
 mod client;
+mod config;
 mod host;
 mod keys;
 
 pub use client::run_client;
+pub use config::{SessionConfig, SessionMode};
 pub use host::run_host;
 
 pub fn local_caps() -> Caps {

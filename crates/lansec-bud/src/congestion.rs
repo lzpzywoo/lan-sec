@@ -24,16 +24,32 @@ pub struct CongestionStats {
 
 impl CongestionController {
     pub fn lan_default() -> Self {
+        Self::from_bps(50_000_000, 40_000_000, 100_000_000)
+    }
+
+    /// Build controller from absolute bitrates (bits/sec). Clamps target into [min, max].
+    pub fn from_bps(target_bps: u32, min_bps: u32, max_bps: u32) -> Self {
+        let min_bps = min_bps.max(1_000_000);
+        let max_bps = max_bps.max(min_bps);
+        let target_bps = target_bps.clamp(min_bps, max_bps);
         Self {
-            // Desktop text on a LAN: fill the pipe so VT CBR/ABR stays sharp.
-            target_bps: 50_000_000,
-            min_bps: 40_000_000,
-            max_bps: 100_000_000,
+            target_bps,
+            min_bps,
+            max_bps,
             rtt_us_ewma: 1_000.0,
             loss_ppm_ewma: 0.0,
             in_flight_bytes: 0,
             last_adjust: None,
         }
+    }
+
+    /// Convenience: Mbps values from the GUI / SessionConfig.
+    pub fn from_mbps(target_mbps: u32, min_mbps: u32, max_mbps: u32) -> Self {
+        Self::from_bps(
+            target_mbps.saturating_mul(1_000_000),
+            min_mbps.saturating_mul(1_000_000),
+            max_mbps.saturating_mul(1_000_000),
+        )
     }
 
     pub fn on_rtt_sample(&mut self, rtt_us: u32) {

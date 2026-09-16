@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 lansec-session.workspace = true
+lansec-ui.workspace = true
 lansec-bud.workspace = true
 clap.workspace = true
 anyhow.workspace = true

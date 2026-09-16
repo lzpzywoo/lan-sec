@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,9 +21,19 @@ use winit::platform::windows::WindowAttributesExtWindows;
 
 use crate::keys;
 use crate::local_caps;
+use crate::SessionConfig;
 
-pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
-    info!(%connect, "client connecting");
+pub fn run_client(cfg: SessionConfig) -> Result<()> {
+    let mut cfg = cfg;
+    cfg.mode = crate::SessionMode::Client;
+    cfg.clamp();
+    let connect = cfg.connect_addr()?;
+    info!(
+        %connect,
+        fps = cfg.target_fps,
+        chroma = ?cfg.chroma,
+        "client connecting"
+    );
     eprintln!(
         "client stats every 0.5s — video=HEVC Mbps  udp_rx=socket Mbps  target=setpoint  gap=max frame interval  wblock=UDP full"
     );
@@ -34,17 +43,21 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
     let player = Player::start().ok();
     let bud = BudEndpoint::bind(BudConfig {
         bind: "0.0.0.0:0".parse().unwrap(),
-        pin,
+        pin: cfg.pin.clone(),
         is_host: false,
+        target_bps: Some(cfg.target_bps()),
+        min_bps: Some(cfg.min_bps()),
+        max_bps: Some(cfg.max_bps()),
     })?;
     bud.connect(connect)?;
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    let present_hz = cfg.target_fps.max(1) as f32;
     let mut app = ClientApp {
         bud,
         local,
         decoder: None,
-        presenter: Presenter::new(60.0),
+        presenter: Presenter::new(present_hz),
         opus: OpusRoundtrip::new().ok(),
         player,
         window: None,
@@ -76,6 +89,7 @@ pub fn run_client(connect: SocketAddr, pin: String) -> Result<()> {
         video_q: VecDeque::new(),
         last_presented: None,
         last_represent: Instant::now(),
+        represent_interval: Duration::from_nanos(1_000_000_000 / cfg.target_fps.max(1) as u64),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -117,6 +131,7 @@ struct ClientApp {
     video_q: VecDeque<VideoAccessUnit>,
     last_presented: Option<lansec_decode::DecodedFrame>,
     last_represent: Instant,
+    represent_interval: Duration,
 }
 
 impl ClientApp {
@@ -441,8 +456,7 @@ impl ClientApp {
     }
 
     fn represent_last_if_due(&mut self) {
-        const INTERVAL: Duration = Duration::from_nanos(16_666_667);
-        if self.last_presented.is_none() || self.last_represent.elapsed() < INTERVAL {
+        if self.last_presented.is_none() || self.last_represent.elapsed() < self.represent_interval {
             return;
         }
         self.last_represent = Instant::now();
