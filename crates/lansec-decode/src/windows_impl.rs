@@ -142,7 +142,8 @@ impl Hevc444Probe {
 unsafe fn hevc_decoder_available() -> bool {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-    find_hevc_mft().is_ok()
+    // Many Intel systems only expose an async HW HEVC MFT (no Sync software MFT).
+    find_hevc_mft().is_ok() || find_hevc_hw_decoder().is_ok()
 }
 
 unsafe fn probe_hevc444() -> windows::core::Result<Hevc444Probe> {
@@ -399,8 +400,8 @@ unsafe fn open_inner(
     if let Ok(mt) = gpu.device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);
     }
-    // 4:4:4: prefer HW-MFT → ARGB32 (skip AYUV→BGRA VP, the white-screen path on Intel).
-    // Fall back to DXVA/MFX + Video Processor CSC only if MFT open fails.
+    // 4:4:4: prefer HW-MFT; fall back to DXVA/MFX + VP CSC if MFT open fails.
+    // 4:2:0: try Sync MFT first, then the same HW-MFT path (Intel often has no Sync HEVC).
     if chroma == Chroma::Yuv444 {
         match open_mf_hevc(gpu, chroma, width, height) {
             Ok(dec) => return Ok(dec),
@@ -414,7 +415,17 @@ unsafe fn open_inner(
         }
         return Err(windows::core::Error::from(E_FAIL));
     }
-    open_mf_hevc(gpu, chroma, width, height)
+    match open_mf_hevc(gpu, chroma, width, height) {
+        Ok(dec) => return Ok(dec),
+        Err(e) => warn!("HEVC 4:2:0 MFT open failed ({e}); trying D3D11VA/MFX"),
+    }
+    if let Some(dec) = open_dxva(gpu, width, height) {
+        return Ok(dec);
+    }
+    if let Some(dec) = open_mfx(gpu, width, height) {
+        return Ok(dec);
+    }
+    Err(windows::core::Error::from(E_FAIL))
 }
 
 unsafe fn open_mf_hevc(
@@ -433,13 +444,18 @@ unsafe fn open_mf_hevc(
         let (t, name) = find_hevc_hw_decoder()?;
         unlock_async(&t)?;
         (t, name, true)
-    } else {
-        let t = find_hevc_mft()?;
+    } else if let Ok(t) = find_hevc_mft() {
         if let Ok(attrs) = t.GetAttributes() {
             let _ = attrs.SetUINT32(&MF_SA_D3D11_AWARE, 1);
             let _ = attrs.SetUINT32(&CODECAPI_AVLowLatencyMode, 1);
         }
         (t, "Media Foundation HEVC decoder".into(), false)
+    } else {
+        // Windows 11 + Intel UHD often ships only an async hardware HEVC MFT.
+        let (t, name) = find_hevc_hw_decoder()?;
+        unlock_async(&t)?;
+        info!(%name, "HEVC 4:2:0 using hardware MFT (no Sync MFT)");
+        (t, name, true)
     };
     transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
 

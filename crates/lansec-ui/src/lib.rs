@@ -139,8 +139,7 @@ impl eframe::App for LauncherApp {
                     ChromaPref::Yuv444.label(),
                 );
             });
-            ui.weak("Advertised to peer. Host merges both sides (420 beats 444; else Auto).");
-            ui.weak("Auto: Win→Mac prefers 4:4:4; Mac→Win prefers 4:2:0 until Win 444 present is solid.");
+            ui.weak("Host-only setting. Auto: Mac→Win prefers 4:2:0; Win→Mac prefers 4:4:4.");
 
             if !self.error.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 60), &self.error);

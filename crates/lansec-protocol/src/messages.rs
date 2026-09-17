@@ -19,6 +19,60 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolErro
     postcard::from_bytes(bytes).map_err(ProtocolError::Decode)
 }
 
+/// Decode a control datagram.
+///
+/// Accepts Caps with an optional trailing `chroma_pref` byte from briefly-shipped
+/// V2 peers. Caps itself no longer carries that field on the wire.
+pub fn decode_control(bytes: &[u8]) -> Result<ControlMsg, ProtocolError> {
+    // Prefer exact consume. Trailing chroma_pref from briefly-shipped V2 Caps must
+    // not be ignored via from_bytes (leftover OK) — re-parse as V2 when rest remains.
+    match postcard::take_from_bytes::<ControlMsg>(bytes) {
+        Ok((msg, rest)) if rest.is_empty() => Ok(msg),
+        Ok((ControlMsg::CapsOffer(_), rest)) if !rest.is_empty() => {
+            decode_control_with_chroma_pref(bytes)
+        }
+        Ok((msg, _)) => Ok(msg),
+        Err(_) => decode_control_with_chroma_pref(bytes),
+    }
+}
+
+fn decode_control_with_chroma_pref(bytes: &[u8]) -> Result<ControlMsg, ProtocolError> {
+    #[derive(Deserialize)]
+    struct CapsV2 {
+        encode: Vec<crate::caps::CodecCap>,
+        decode: Vec<crate::caps::CodecCap>,
+        audio: bool,
+        input: bool,
+        platform: crate::caps::Platform,
+        #[allow(dead_code)]
+        chroma_pref: crate::caps::ChromaPref,
+    }
+
+    #[derive(Deserialize)]
+    enum ControlV2 {
+        CapsOffer(CapsV2),
+        CapsAccept { format: NegotiatedFormat },
+        RequestIdr,
+        Congestion(CongestionReport),
+        Bye,
+    }
+
+    let v2: ControlV2 = postcard::from_bytes(bytes).map_err(ProtocolError::Decode)?;
+    Ok(match v2 {
+        ControlV2::CapsOffer(c) => ControlMsg::CapsOffer(Caps {
+            encode: c.encode,
+            decode: c.decode,
+            audio: c.audio,
+            input: c.input,
+            platform: c.platform,
+        }),
+        ControlV2::CapsAccept { format } => ControlMsg::CapsAccept { format },
+        ControlV2::RequestIdr => ControlMsg::RequestIdr,
+        ControlV2::Congestion(r) => ControlMsg::Congestion(r),
+        ControlV2::Bye => ControlMsg::Bye,
+    })
+}
+
 /// Logical BUD channels. Video/audio are unreliable. Control is reliable.
 /// Input clicks/keys are reliable; mouse moves are sent unreliable (latest-wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,5 +157,53 @@ mod tests {
         let bytes = encode(&msg).unwrap();
         let back: ControlMsg = decode(&bytes).unwrap();
         assert!(matches!(back, ControlMsg::RequestIdr));
+    }
+
+    #[test]
+    fn decode_control_accepts_caps_with_or_without_chroma_pref() {
+        use crate::caps::{Chroma, CodecCap, DecodeBackend, EncodeBackend, Platform};
+
+        // Current wire (no chroma_pref).
+        let v1 = ControlMsg::CapsOffer(Caps {
+            encode: vec![],
+            decode: vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)],
+            audio: true,
+            input: true,
+            platform: Platform::Windows,
+        });
+        let bytes = encode(&v1).unwrap();
+        let msg = decode_control(&bytes).unwrap();
+        assert!(matches!(msg, ControlMsg::CapsOffer(_)));
+
+        // Brief V2 (with chroma_pref) from peers that still send it.
+        #[derive(Serialize)]
+        struct CapsV2 {
+            encode: Vec<CodecCap>,
+            decode: Vec<CodecCap>,
+            audio: bool,
+            input: bool,
+            platform: Platform,
+            chroma_pref: crate::caps::ChromaPref,
+        }
+        #[derive(Serialize)]
+        enum ControlV2 {
+            CapsOffer(CapsV2),
+        }
+        let v2 = ControlV2::CapsOffer(CapsV2 {
+            encode: vec![CodecCap::encode(
+                EncodeBackend::VideoToolbox,
+                Chroma::Yuv420,
+                1920,
+                1080,
+            )],
+            decode: vec![],
+            audio: true,
+            input: true,
+            platform: Platform::Macos,
+            chroma_pref: crate::caps::ChromaPref::Auto,
+        });
+        let bytes2 = postcard::to_allocvec(&v2).unwrap();
+        let back = decode_control(&bytes2).unwrap();
+        assert!(matches!(back, ControlMsg::CapsOffer(_)));
     }
 }

@@ -8,7 +8,8 @@ use lansec_bud::{BudConfig, BudEndpoint, Incoming};
 use lansec_decode::{open_decoder, HardwareDecoder};
 use lansec_present::Presenter;
 use lansec_protocol::{
-    decode, encode, Caps, Channel, ControlMsg, InputEvent, SessionClock, VideoAccessUnit,
+    decode, decode_control, encode, Caps, Channel, ControlMsg, InputEvent, SessionClock,
+    VideoAccessUnit,
 };
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
@@ -178,7 +179,7 @@ impl ClientApp {
                     channel: Channel::Control,
                     payload,
                     ..
-                } => match decode::<ControlMsg>(&payload) {
+                } => match decode_control(&payload) {
                     Ok(ControlMsg::CapsOffer(remote)) => {
                         info!(
                             encode = remote.encode.len(),
@@ -253,22 +254,50 @@ impl ClientApp {
     }
 
     fn open_decoder(&mut self, chroma: lansec_protocol::Chroma, width: u32, height: u32) {
+        let w = width.max(1);
+        let h = height.max(1);
         #[cfg(windows)]
         {
-            self.decoder = if let Some(gpu) = self.gpu.as_ref() {
-                lansec_decode::open_decoder_with_gpu(gpu, chroma, width.max(1), height.max(1)).ok()
-            } else {
-                open_decoder(chroma, width.max(1), height.max(1)).ok()
-            };
+            self.decoder = None;
+            if let Some(gpu) = self.gpu.as_ref() {
+                match lansec_decode::open_decoder_with_gpu(gpu, chroma, w, h) {
+                    Ok(dec) => self.decoder = Some(dec),
+                    Err(e) => warn!(%e, ?chroma, w, h, "open_decoder_with_gpu failed"),
+                }
+            }
+            if self.decoder.is_none() {
+                match open_decoder(chroma, w, h) {
+                    Ok(dec) => self.decoder = Some(dec),
+                    Err(e) => warn!(%e, ?chroma, w, h, "open_decoder failed"),
+                }
+            }
+            // CapsAccept may ask for 444 that Intel cannot present; always keep a 420 path.
+            if self.decoder.is_none() && chroma != lansec_protocol::Chroma::Yuv420 {
+                warn!(?chroma, "falling back to HEVC 4:2:0 decoder");
+                if let Some(gpu) = self.gpu.as_ref() {
+                    self.decoder =
+                        lansec_decode::open_decoder_with_gpu(gpu, lansec_protocol::Chroma::Yuv420, w, h)
+                            .ok();
+                }
+                if self.decoder.is_none() {
+                    self.decoder = open_decoder(lansec_protocol::Chroma::Yuv420, w, h).ok();
+                }
+            }
         }
         #[cfg(not(windows))]
         {
-            self.decoder = open_decoder(chroma, width.max(1), height.max(1)).ok();
+            match open_decoder(chroma, w, h) {
+                Ok(dec) => self.decoder = Some(dec),
+                Err(e) => {
+                    warn!(%e, ?chroma, w, h, "open_decoder failed");
+                    self.decoder = None;
+                }
+            }
         }
         if let Some(dec) = self.decoder.as_ref() {
-            info!(backend = ?dec.backend(), ?chroma, width, height, "hardware decoder ready");
+            info!(backend = ?dec.backend(), ?chroma, width = w, height = h, "hardware decoder ready");
         } else {
-            warn!("hardware decoder unavailable");
+            warn!(?chroma, width = w, height = h, "hardware decoder unavailable");
         }
         self.invalidate_present_targets();
     }
@@ -314,15 +343,24 @@ impl ClientApp {
                     w = au.width,
                     h = au.height,
                     key = au.is_keyframe,
-                    "video arrived before CapsAccept decoder; waiting (no blind 420 open)"
+                    "video arrived before decoder; trying HEVC 4:2:0 open"
                 );
             }
-            // Do not open a Yuv420 decoder here — wrong chroma on Win↔Mac reverse
-            // sessions produces green/corrupt frames. Wait for CapsAccept.
-            if au.is_keyframe {
+            // Last resort for Mac→Win white screen: CapsAccept missing/failed open.
+            // Prefer 420 only — blind 444 was the green/white path on Intel.
+            if au.is_keyframe && au.width > 0 {
+                self.open_decoder(
+                    lansec_protocol::Chroma::Yuv420,
+                    au.width as u32,
+                    au.height as u32,
+                );
+                self.request_idr();
+            } else if au.is_keyframe {
                 self.request_idr();
             }
-            return;
+            if self.decoder.is_none() {
+                return;
+            }
         }
         if let Some(dec) = self.decoder.as_mut() {
             let t_dec = Instant::now();

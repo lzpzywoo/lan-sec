@@ -16,8 +16,8 @@ use lansec_input::{inject_with_buttons, MouseButtons};
 #[cfg(not(target_os = "macos"))]
 use lansec_input::inject;
 use lansec_protocol::{
-    decode, encode, Caps, Channel, Chroma, ChromaPref, ControlMsg, FrameTimes, InputEvent, NegotiatedFormat,
-    VideoAccessUnit,
+    decode, decode_control, encode, Caps, Channel, Chroma, ChromaPref, ControlMsg, EncodeBackend,
+    DecodeBackend, FrameTimes, InputEvent, NegotiatedFormat, Platform, VideoAccessUnit,
 };
 use tracing::{info, warn};
 
@@ -219,7 +219,37 @@ pub fn run_host(cfg: crate::SessionConfig) -> Result<()> {
                 need_idr.store(true, Ordering::Relaxed);
             }
             Ok(HostCmd::CapsOffer(remote)) => {
-                match negotiate_with_size(&local, &remote, capture.as_ref(), chroma_pref, remote.chroma_pref) {
+                let mut remote = remote;
+                // Older / probe-failed Windows clients sometimes advertise encode only
+                // (empty decode). Assume D3D11VA HEVC so Mac→Win can still negotiate.
+                if remote.decode.is_empty()
+                    && matches!(remote.platform, Platform::Windows | Platform::Unknown)
+                {
+                    warn!("peer decode caps empty; synthesizing D3D11VA HEVC 4:2:0/4:4:4");
+                    remote.decode = vec![
+                        lansec_protocol::CodecCap::decode(
+                            DecodeBackend::D3d11va,
+                            Chroma::Yuv420,
+                            3840,
+                            2160,
+                        ),
+                        lansec_protocol::CodecCap::decode(
+                            DecodeBackend::D3d11va,
+                            Chroma::Yuv444,
+                            3840,
+                            2160,
+                        ),
+                    ];
+                }
+                // Prefer host SessionConfig chroma; Mac→Win always force 420 (Win 444 present is unsafe).
+                let pref = if local.platform == Platform::Macos
+                    && matches!(remote.platform, Platform::Windows | Platform::Unknown)
+                {
+                    ChromaPref::Yuv420
+                } else {
+                    chroma_pref
+                };
+                match negotiate_with_size(&local, &remote, capture.as_ref(), pref) {
                     Ok(fmt) => {
                         info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
                         if fmt.chroma == Chroma::Yuv420 {
@@ -244,7 +274,60 @@ pub fn run_host(cfg: crate::SessionConfig) -> Result<()> {
                         encoder = None;
                         last_bps = 0;
                     }
-                    Err(e) => warn!("negotiate: {e}"),
+                    Err(e) => {
+                        warn!(
+                            %e,
+                            local_encode = local.encode.len(),
+                            remote_decode = remote.decode.len(),
+                            remote_encode = remote.encode.len(),
+                            remote_platform = ?remote.platform,
+                            "negotiate failed; peer caps dump follows"
+                        );
+                        for (i, c) in remote.decode.iter().enumerate() {
+                            warn!(i, chroma = ?c.chroma, decode = ?c.decode, "peer decode cap");
+                        }
+                        for (i, c) in remote.encode.iter().enumerate() {
+                            warn!(i, chroma = ?c.chroma, encode = ?c.encode, "peer encode cap");
+                        }
+                        // Mac host → Windows client: force HEVC 4:2:0 so a white screen from
+                        // empty/corrupt peer decode ads still gets a stream (client opens from CapsAccept).
+                        if local.platform == Platform::Macos
+                            && matches!(remote.platform, Platform::Windows | Platform::Unknown)
+                            && local.encode.iter().any(|c| {
+                                c.chroma == Chroma::Yuv420 && c.encode == Some(EncodeBackend::VideoToolbox)
+                            })
+                        {
+                            let (w, h) = capture
+                                .as_ref()
+                                .map(|c| c.size())
+                                .unwrap_or((1920, 1080));
+                            let fmt = NegotiatedFormat {
+                                codec: lansec_protocol::Codec::Hevc,
+                                chroma: Chroma::Yuv420,
+                                bit_depth: 8,
+                                encode: EncodeBackend::VideoToolbox,
+                                decode: DecodeBackend::D3d11va,
+                                width: w as u16,
+                                height: h as u16,
+                            };
+                            warn!(
+                                chroma = fmt.chroma_label(),
+                                "falling back to Mac→Win HEVC 4:2:0 CapsAccept"
+                            );
+                            println!(
+                                "stream format: {} encode={:?} decode={:?} (fallback)",
+                                fmt.chroma_label(),
+                                fmt.encode,
+                                fmt.decode
+                            );
+                            if let Ok(bytes) = encode(&ControlMsg::CapsAccept { format: fmt }) {
+                                let _ = bud.send(Channel::Control, &bytes, 0, true);
+                            }
+                            format = Some(fmt);
+                            encoder = None;
+                            last_bps = 0;
+                        }
+                    }
                 }
             }
             Ok(HostCmd::CapsAccept(fmt)) => {
@@ -420,7 +503,7 @@ fn net_loop(
                     channel: Channel::Control,
                     payload,
                     ..
-                } => match decode::<ControlMsg>(&payload) {
+                } => match decode_control(&payload) {
                     Ok(ControlMsg::CapsOffer(remote)) => {
                         if tx.send(HostCmd::CapsOffer(remote)).is_err() {
                             return;
@@ -496,10 +579,8 @@ fn negotiate_with_size(
     remote: &Caps,
     capture: Option<&CaptureSession>,
     host_pref: ChromaPref,
-    client_pref: ChromaPref,
 ) -> Result<NegotiatedFormat> {
-    let pref = lansec_protocol::merge_chroma_pref(host_pref, client_pref);
-    let mut fmt = lansec_protocol::negotiate_with_pref(local, remote, pref)
+    let mut fmt = lansec_protocol::negotiate_with_pref(local, remote, host_pref)
         .ok_or_else(|| anyhow!("no common codec"))?;
     if let Some(cap) = capture {
         let (w, h) = cap.size();

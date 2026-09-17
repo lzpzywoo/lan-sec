@@ -14,18 +14,18 @@ pub use config::{SessionConfig, SessionMode};
 pub use host::run_host;
 
 pub fn local_caps() -> Caps {
-    local_caps_with_pref(lansec_protocol::ChromaPref::Auto)
-}
-
-pub fn local_caps_with_pref(chroma_pref: lansec_protocol::ChromaPref) -> Caps {
     Caps {
         encode: lansec_encode::probe_encode(),
         decode: lansec_decode::probe_decode(),
         audio: true,
         input: true,
         platform: Platform::current(),
-        chroma_pref,
     }
+}
+
+pub fn local_caps_with_pref(_chroma_pref: lansec_protocol::ChromaPref) -> Caps {
+    // ChromaPref is SessionConfig-only (not on Caps wire) for postcard compat with older peers.
+    local_caps()
 }
 
 pub fn print_probe() {
