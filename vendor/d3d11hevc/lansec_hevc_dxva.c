@@ -571,6 +571,24 @@ static HRESULT copy_buf(ID3D11VideoContext *vctx, ID3D11VideoDecoder *dec, D3D11
     return ID3D11VideoContext_ReleaseDecoderBuffer(vctx, dec, ty);
 }
 
+/* Flat default HEVC scaling lists (all 16). Intel expects an IQM buffer even when
+ * sps_scaling_list_enabled_flag is 0 — omitting it makes SubmitDecoderBuffers fail. */
+static void fill_default_qm(DXVA_Qmatrix_HEVC *qm) {
+    memset(qm, 0, sizeof(*qm));
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 16; j++) qm->ucScalingLists0[i][j] = 16;
+        for (int j = 0; j < 64; j++) {
+            qm->ucScalingLists1[i][j] = 16;
+            qm->ucScalingLists2[i][j] = 16;
+        }
+        qm->ucScalingListDCCoefSizeID2[i] = 16;
+    }
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 64; j++) qm->ucScalingLists3[i][j] = 16;
+        qm->ucScalingListDCCoefSizeID3[i] = 16;
+    }
+}
+
 int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **out_tex) {
     DxvaDec *d = (DxvaDec *)dec;
     if (!d || !annexb || len <= 0 || !out_tex) return -1;
@@ -582,10 +600,10 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     while (next_nal(annexb, len, &off, &nal, &nlen)) {
         int t = nal_type(nal, (size_t)nlen);
         if (t == 33) {
-            if (!parse_sps(nal, (size_t)nlen, &d->sps)) return -1;
+            if (!parse_sps(nal, (size_t)nlen, &d->sps)) return -2;
             d->have_sps = 1;
         } else if (t == 34) {
-            if (!parse_pps(nal, (size_t)nlen, &d->pps)) return -1;
+            if (!parse_pps(nal, (size_t)nlen, &d->pps)) return -3;
             d->have_pps = 1;
         } else if (t == 19 || t == 20) {
             idr = 1;
@@ -605,16 +623,16 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
         }
     }
     if (!d->have_sps || !d->have_pps || !slice) return 0;
+    /* Homemade DXVA only tracks one ref; drop P/B until an IDR refreshes DPB. */
+    if (!idr && d->last_slot < 0) return 0;
     int poc = 0;
     if (!idr) {
-        /* slice_pic_order_cnt_lsb after first_slice + pps id + slice_type */
         Br b;
         br_init(&b, slice + 2, (size_t)slice_len - 2);
         br_u(&b, 1);
         if (irap) br_u(&b, 1);
         br_ue(&b);
-        int st = (int)br_ue(&b);
-        (void)st;
+        (void)br_ue(&b);
         if (d->pps.output_flag_present_flag) br_u(&b, 1);
         int lsb_bits = d->sps.log2_max_poc_lsb_minus4 + 4;
         poc = (int)br_u(&b, lsb_bits);
@@ -631,6 +649,8 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     fill_picparams(d, irap, idr, idr || irap, poc, slot, &pp);
     const void *pp_ptr = d->yuv444 ? (const void *)&pp : (const void *)&pp.params;
     UINT pp_size = d->yuv444 ? (UINT)sizeof(pp) : (UINT)sizeof(pp.params);
+    DXVA_Qmatrix_HEVC qm;
+    fill_default_qm(&qm);
     DXVA_Slice_HEVC_Short sl;
     memset(&sl, 0, sizeof(sl));
     sl.BSNALunitDataLocation = 0;
@@ -638,25 +658,29 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     sl.wBadSliceChopping = 0;
 
     HRESULT hr = ID3D11VideoContext_DecoderBeginFrame(d->vctx, d->decoder, d->view[slot], 0, NULL);
-    if (FAILED(hr)) return -1;
+    if (FAILED(hr)) return -10;
     hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, pp_ptr, pp_size);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) { ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder); return -11; }
+    hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, &qm, (UINT)sizeof(qm));
+    if (FAILED(hr)) { ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder); return -12; }
     hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, &sl, sizeof(sl));
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) { ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder); return -13; }
     hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, annexb, (UINT)len);
-    if (FAILED(hr)) goto fail;
-    D3D11_VIDEO_DECODER_BUFFER_DESC bd[3];
+    if (FAILED(hr)) { ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder); return -14; }
+    D3D11_VIDEO_DECODER_BUFFER_DESC bd[4];
     memset(bd, 0, sizeof(bd));
     bd[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
     bd[0].DataSize = pp_size;
-    bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
-    bd[1].DataSize = sizeof(sl);
-    bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
-    bd[2].DataSize = (UINT)len;
-    hr = ID3D11VideoContext_SubmitDecoderBuffers(d->vctx, d->decoder, 3, bd);
-    if (FAILED(hr)) goto fail;
+    bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX;
+    bd[1].DataSize = (UINT)sizeof(qm);
+    bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+    bd[2].DataSize = sizeof(sl);
+    bd[3].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+    bd[3].DataSize = (UINT)len;
+    hr = ID3D11VideoContext_SubmitDecoderBuffers(d->vctx, d->decoder, 4, bd);
+    if (FAILED(hr)) { ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder); return -15; }
     hr = ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder);
-    if (FAILED(hr)) return -1;
+    if (FAILED(hr)) return -17;
     ID3D11Texture2D_AddRef(d->tex[slot]);
     *out_tex = d->tex[slot];
     d->used[slot] = 1;
@@ -665,7 +689,5 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     d->last_poc = poc;
     (void)slice_type_nal;
     return 1;
-fail:
-    ID3D11VideoContext_DecoderEndFrame(d->vctx, d->decoder);
-    return -1;
 }
+

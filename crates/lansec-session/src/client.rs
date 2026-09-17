@@ -76,6 +76,7 @@ pub fn run_client(cfg: SessionConfig) -> Result<()> {
         video_frames: 0,
         video_without_decoder: 0,
         decode_idle: 0,
+        await_keyframe: false,
         decode_errors: 0,
         win_frames: 0,
         win_video_bytes: 0,
@@ -118,6 +119,8 @@ struct ClientApp {
     video_frames: u64,
     video_without_decoder: u64,
     decode_idle: u64,
+    /// After opening a decoder, ignore P-frames until the first IDR arrives.
+    await_keyframe: bool,
     decode_errors: u64,
     win_frames: u32,
     win_video_bytes: u64,
@@ -296,6 +299,8 @@ impl ClientApp {
         }
         if let Some(dec) = self.decoder.as_ref() {
             info!(backend = ?dec.backend(), ?chroma, width = w, height = h, "hardware decoder ready");
+            self.await_keyframe = true;
+            self.request_idr();
         } else {
             warn!(?chroma, width = w, height = h, "hardware decoder unavailable");
         }
@@ -362,6 +367,14 @@ impl ClientApp {
                 return;
             }
         }
+        if self.await_keyframe {
+            if !au.is_keyframe {
+                self.request_idr();
+                return;
+            }
+            self.await_keyframe = false;
+            info!("first IDR after decoder open; starting decode");
+        }
         if let Some(dec) = self.decoder.as_mut() {
             let t_dec = Instant::now();
             match dec.decode(&au.annexb, au.is_keyframe) {
@@ -399,6 +412,10 @@ impl ClientApp {
                     self.decode_errors += 1;
                     if self.decode_errors == 1 || self.decode_errors % 60 == 0 {
                         warn!(n = self.decode_errors, "decode: {e}");
+                    }
+                    if self.decode_errors == 1 || self.decode_errors % 30 == 0 {
+                        self.await_keyframe = true;
+                        self.request_idr();
                     }
                 }
             }
