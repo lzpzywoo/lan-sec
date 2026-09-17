@@ -73,6 +73,9 @@ pub struct Caps {
     pub audio: bool,
     pub input: bool,
     pub platform: Platform,
+    /// Peer's local chroma preference (host merges with its own when negotiating).
+    #[serde(default)]
+    pub chroma_pref: ChromaPref,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -115,7 +118,7 @@ impl NegotiatedFormat {
     }
 }
 
-/// User preference for chroma negotiation (local override; not on the wire).
+/// User preference for chroma negotiation. Advertised in `Caps.chroma_pref`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ChromaPref {
     /// Keep platform-aware default order (Mac→Win prefers 420 today).
@@ -137,12 +140,22 @@ impl ChromaPref {
     }
 }
 
+/// Combine host and client prefs. Explicit 420 always wins (safer); else explicit 444; else Auto.
+pub fn merge_chroma_pref(host: ChromaPref, client: ChromaPref) -> ChromaPref {
+    match (host, client) {
+        (ChromaPref::Yuv420, _) | (_, ChromaPref::Yuv420) => ChromaPref::Yuv420,
+        (ChromaPref::Yuv444, _) | (_, ChromaPref::Yuv444) => ChromaPref::Yuv444,
+        _ => ChromaPref::Auto,
+    }
+}
+
 /// Prefer HEVC 4:4:4 8-bit, then HEVC 4:2:0. Intersection of host encode and client decode.
 ///
 /// Mac host → Windows client stays on 4:2:0 until Intel Main444 present is verified
 /// non-green (ARGB32-as-YUV showed solid green; AYUV CSC still under test).
 pub fn negotiate(host: &Caps, client: &Caps) -> Option<NegotiatedFormat> {
-    negotiate_with_pref(host, client, ChromaPref::Auto)
+    let pref = merge_chroma_pref(host.chroma_pref, client.chroma_pref);
+    negotiate_with_pref(host, client, pref)
 }
 
 pub fn negotiate_with_pref(host: &Caps, client: &Caps, pref: ChromaPref) -> Option<NegotiatedFormat> {
@@ -196,6 +209,7 @@ mod tests {
             audio: true,
             input: true,
             platform: Platform::Windows,
+            ..Default::default()
         };
         let client = Caps {
             encode: vec![],
@@ -206,6 +220,7 @@ mod tests {
             audio: true,
             input: true,
             platform: Platform::Macos,
+            ..Default::default()
         };
         let fmt = negotiate(&host, &client).unwrap();
         assert_eq!(fmt.chroma, Chroma::Yuv444);
@@ -224,6 +239,7 @@ mod tests {
             audio: true,
             input: true,
             platform: Platform::Macos,
+            ..Default::default()
         };
         let client = Caps {
             encode: vec![],
@@ -234,6 +250,7 @@ mod tests {
             audio: true,
             input: true,
             platform: Platform::Windows,
+            ..Default::default()
         };
         let fmt = negotiate(&host, &client).unwrap();
         assert_eq!(fmt.chroma, Chroma::Yuv420);
@@ -257,6 +274,7 @@ mod tests {
             audio: false,
             input: true,
             platform: Platform::Macos,
+            ..Default::default()
         };
         let client = Caps {
             encode: vec![],
@@ -267,8 +285,20 @@ mod tests {
             audio: false,
             input: true,
             platform: Platform::Windows,
+            ..Default::default()
         };
         let fmt = negotiate(&host, &client).unwrap();
         assert_eq!(fmt.chroma, Chroma::Yuv420);
+    }
+    #[test]
+    fn merge_pref_420_wins() {
+        assert_eq!(
+            merge_chroma_pref(ChromaPref::Yuv444, ChromaPref::Yuv420),
+            ChromaPref::Yuv420
+        );
+        assert_eq!(
+            merge_chroma_pref(ChromaPref::Auto, ChromaPref::Yuv444),
+            ChromaPref::Yuv444
+        );
     }
 }

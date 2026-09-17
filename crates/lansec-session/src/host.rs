@@ -21,13 +21,37 @@ use lansec_protocol::{
 };
 use tracing::{info, warn};
 
-use crate::local_caps;
+use crate::local_caps_with_pref;
 
 enum HostCmd {
     Established,
     CapsOffer(Caps),
     CapsAccept(NegotiatedFormat),
     Bye,
+}
+
+/// Track pressed buttons so we never coalesce moves during a drag (Mac or Windows host).
+#[derive(Default)]
+struct HeldMouse {
+    left: bool,
+    right: bool,
+    middle: bool,
+}
+
+impl HeldMouse {
+    fn any_down(&self) -> bool {
+        self.left || self.right || self.middle
+    }
+
+    fn note(&mut self, ev: &InputEvent) {
+        if let InputEvent::MouseButton { button, down } = *ev {
+            match button {
+                0 => self.left = down,
+                1 => self.right = down,
+                _ => self.middle = down,
+            }
+        }
+    }
 }
 
 struct HostStats {
@@ -139,7 +163,7 @@ pub fn run_host(cfg: crate::SessionConfig) -> Result<()> {
     eprintln!(
         "host stats every 0.5s — video=HEVC Mbps  udp_tx=socket Mbps  target=setpoint  encode=avg/max  skip=encode miss  fresh/repeat=SCK  wblock=UDP full"
     );
-    let local = local_caps();
+    let local = local_caps_with_pref(cfg.chroma);
     let chroma_pref = cfg.chroma;
     let (tx, rx) = mpsc::channel::<HostCmd>();
     let need_idr = Arc::new(AtomicBool::new(true));
@@ -195,7 +219,7 @@ pub fn run_host(cfg: crate::SessionConfig) -> Result<()> {
                 need_idr.store(true, Ordering::Relaxed);
             }
             Ok(HostCmd::CapsOffer(remote)) => {
-                match negotiate_with_size(&local, &remote, capture.as_ref(), chroma_pref) {
+                match negotiate_with_size(&local, &remote, capture.as_ref(), chroma_pref, remote.chroma_pref) {
                     Ok(fmt) => {
                         info!(chroma = fmt.chroma_label(), encode = ?fmt.encode, decode = ?fmt.decode, "negotiated");
                         if fmt.chroma == Chroma::Yuv420 {
@@ -365,6 +389,7 @@ fn net_loop(
 ) {
     #[cfg(target_os = "macos")]
     let mut mouse_buttons = MouseButtons::default();
+    let mut held = HeldMouse::default();
     loop {
         if bye.load(Ordering::Relaxed) {
             return;
@@ -375,12 +400,8 @@ fn net_loop(
             continue;
         }
         let idle = incoming.is_empty();
-        // While a button is held, every move must be injected as LeftMouseDragged.
-        // Coalescing here made window drags "teleport" on mouse-up.
-        #[cfg(target_os = "macos")]
-        let coalesce_moves = !mouse_buttons.any_down();
-        #[cfg(not(target_os = "macos"))]
-        let coalesce_moves = true;
+        // While a button is held, every move must be injected (Mac LeftMouseDragged /
+        // Win continuous moves). Coalescing made window drags "teleport" on mouse-up.
         let mut last_move = None;
         for msg in incoming {
             match msg {
@@ -428,7 +449,7 @@ fn net_loop(
                 } => {
                     if let Ok(ev) = decode::<InputEvent>(&payload) {
                         if matches!(ev, InputEvent::MouseMoveAbs { .. } | InputEvent::MouseMoveRel { .. }) {
-                            if coalesce_moves {
+                            if !held.any_down() {
                                 last_move = Some(ev);
                             } else {
                                 #[cfg(target_os = "macos")]
@@ -445,6 +466,7 @@ fn net_loop(
                                 let _ = inject(&mv);
                                 input_count.fetch_add(1, Ordering::Relaxed);
                             }
+                            held.note(&ev);
                             #[cfg(target_os = "macos")]
                             let _ = inject_with_buttons(&ev, &mut mouse_buttons);
                             #[cfg(not(target_os = "macos"))]
@@ -473,8 +495,10 @@ fn negotiate_with_size(
     local: &Caps,
     remote: &Caps,
     capture: Option<&CaptureSession>,
-    pref: ChromaPref,
+    host_pref: ChromaPref,
+    client_pref: ChromaPref,
 ) -> Result<NegotiatedFormat> {
+    let pref = lansec_protocol::merge_chroma_pref(host_pref, client_pref);
     let mut fmt = lansec_protocol::negotiate_with_pref(local, remote, pref)
         .ok_or_else(|| anyhow!("no common codec"))?;
     if let Some(cap) = capture {

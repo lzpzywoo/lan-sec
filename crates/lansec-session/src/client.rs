@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 use winit::platform::windows::WindowAttributesExtWindows;
 
 use crate::keys;
-use crate::local_caps;
+use crate::local_caps_with_pref;
 use crate::SessionConfig;
 
 pub fn run_client(cfg: SessionConfig) -> Result<()> {
@@ -37,7 +37,7 @@ pub fn run_client(cfg: SessionConfig) -> Result<()> {
     eprintln!(
         "client stats every 0.5s — video=HEVC Mbps  udp_rx=socket Mbps  target=setpoint  gap=max frame interval  wblock=UDP full"
     );
-    let local = local_caps();
+    let local = local_caps_with_pref(cfg.chroma);
     #[cfg(windows)]
     let gpu = lansec_capture::GpuContext::new().ok();
     let player = Player::start().ok();
@@ -314,16 +314,15 @@ impl ClientApp {
                     w = au.width,
                     h = au.height,
                     key = au.is_keyframe,
-                    "video arrived before decoder; requesting IDR after CapsAccept"
+                    "video arrived before CapsAccept decoder; waiting (no blind 420 open)"
                 );
             }
-            if au.is_keyframe && au.width > 0 {
-                // Last-resort: still no CapsAccept. Decode 4:2:0 at the AU size.
-                self.open_decoder(lansec_protocol::Chroma::Yuv420, au.width as u32, au.height as u32);
-                if let Ok(bytes) = encode(&ControlMsg::RequestIdr) {
-                    let _ = self.bud.send(Channel::Control, &bytes, 0, true);
-                }
+            // Do not open a Yuv420 decoder here — wrong chroma on Win↔Mac reverse
+            // sessions produces green/corrupt frames. Wait for CapsAccept.
+            if au.is_keyframe {
+                self.request_idr();
             }
+            return;
         }
         if let Some(dec) = self.decoder.as_mut() {
             let t_dec = Instant::now();

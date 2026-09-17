@@ -13,8 +13,8 @@ pub fn run_launcher() -> Result<Option<SessionConfig>> {
     let started_ui = Arc::clone(&started);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 420.0])
-            .with_min_inner_size([360.0, 360.0])
+            .with_inner_size([440.0, 460.0])
+            .with_min_inner_size([380.0, 400.0])
             .with_title("lansec"),
         ..Default::default()
     };
@@ -62,17 +62,21 @@ impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("lansec");
-            ui.label("LAN remote desktop — configure then Start");
+            ui.label("Bidirectional LAN remote desktop — either machine can Host or Client");
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
                 ui.label("Mode");
-                ui.selectable_value(&mut self.cfg.mode, SessionMode::Host, SessionMode::Host.label());
+                ui.selectable_value(&mut self.cfg.mode, SessionMode::Host, "Host (share this PC)");
                 ui.selectable_value(
                     &mut self.cfg.mode,
                     SessionMode::Client,
-                    SessionMode::Client.label(),
+                    "Client (view remote)",
                 );
+            });
+            ui.weak(match self.cfg.mode {
+                SessionMode::Host => "This PC encodes the desktop; the other side connects in.",
+                SessionMode::Client => "Connect to a Host. FPS/Mbps here are hints; Host owns encode.",
             });
 
             ui.add_space(4.0);
@@ -135,6 +139,8 @@ impl eframe::App for LauncherApp {
                     ChromaPref::Yuv444.label(),
                 );
             });
+            ui.weak("Advertised to peer. Host merges both sides (420 beats 444; else Auto).");
+            ui.weak("Auto: Win→Mac prefers 4:4:4; Mac→Win prefers 4:2:0 until Win 444 present is solid.");
 
             if !self.error.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 60), &self.error);
