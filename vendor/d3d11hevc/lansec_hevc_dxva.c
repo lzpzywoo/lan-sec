@@ -8,6 +8,8 @@
 #include <string.h>
 #include "lansec_hevc_dxva.h"
 
+/* D3D11_DECODER_PROFILE_HEVC_VLD_MAIN / DXVA_ModeHEVC_VLD_Main */
+static const GUID kHevcMain = {0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}};
 static const GUID kHevc444 = {0x4008018f, 0xf537, 0x4b36, {0x98, 0xcf, 0x61, 0xaf, 0x8a, 0x2c, 0x1a, 0x33}};
 static const GUID kHevc444Intel = {0x41a5af96, 0xe415, 0x4b0c, {0x9d, 0x03, 0x90, 0x78, 0x58, 0xe2, 0x3e, 0x78}};
 
@@ -97,6 +99,8 @@ typedef struct {
     int next_slot;
     int last_slot;
     int last_poc;
+    int yuv444;
+    DXGI_FORMAT out_format;
 } DxvaDec;
 
 static void br_init(Br *b, const uint8_t *p, size_t n) {
@@ -335,27 +339,37 @@ static int next_nal(const uint8_t *data, int len, int *off, const uint8_t **nal,
     return 0;
 }
 
-static int pick_profile(ID3D11VideoDevice *vdev, GUID *out) {
+static int pick_profile(ID3D11VideoDevice *vdev, int yuv444, GUID *out, DXGI_FORMAT *fmt) {
     BOOL ok = FALSE;
-    if (SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &kHevc444Intel, DXGI_FORMAT_AYUV, &ok)) && ok) {
-        *out = kHevc444Intel;
-        return 1;
+    if (yuv444) {
+        if (SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &kHevc444Intel, DXGI_FORMAT_AYUV, &ok)) && ok) {
+            *out = kHevc444Intel;
+            *fmt = DXGI_FORMAT_AYUV;
+            return 1;
+        }
+        ok = FALSE;
+        if (SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &kHevc444, DXGI_FORMAT_AYUV, &ok)) && ok) {
+            *out = kHevc444;
+            *fmt = DXGI_FORMAT_AYUV;
+            return 1;
+        }
+        return 0;
     }
-    ok = FALSE;
-    if (SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &kHevc444, DXGI_FORMAT_AYUV, &ok)) && ok) {
-        *out = kHevc444;
+    if (SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &kHevcMain, DXGI_FORMAT_NV12, &ok)) && ok) {
+        *out = kHevcMain;
+        *fmt = DXGI_FORMAT_NV12;
         return 1;
     }
     return 0;
 }
 
-static int pick_config(ID3D11VideoDevice *vdev, const GUID *profile, UINT w, UINT h, D3D11_VIDEO_DECODER_CONFIG *cfg) {
+static int pick_config(ID3D11VideoDevice *vdev, const GUID *profile, DXGI_FORMAT fmt, UINT w, UINT h, D3D11_VIDEO_DECODER_CONFIG *cfg) {
     D3D11_VIDEO_DECODER_DESC desc;
     memset(&desc, 0, sizeof(desc));
     desc.Guid = *profile;
     desc.SampleWidth = w;
     desc.SampleHeight = h;
-    desc.OutputFormat = DXGI_FORMAT_AYUV;
+    desc.OutputFormat = fmt;
     UINT n = 0;
     if (FAILED(ID3D11VideoDevice_GetVideoDecoderConfigCount(vdev, &desc, &n)) || n == 0) return 0;
     for (UINT i = 0; i < n; i++) {
@@ -370,38 +384,40 @@ static int pick_config(ID3D11VideoDevice *vdev, const GUID *profile, UINT w, UIN
     return SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(vdev, &desc, 0, cfg));
 }
 
-static int create_decoder(ID3D11VideoDevice *vdev, UINT w, UINT h, GUID *profile, D3D11_VIDEO_DECODER_CONFIG *cfg, ID3D11VideoDecoder **dec) {
-    if (!pick_profile(vdev, profile)) return 0;
-    if (!pick_config(vdev, profile, w, h, cfg)) return 0;
+static int create_decoder(ID3D11VideoDevice *vdev, int yuv444, UINT w, UINT h, GUID *profile, DXGI_FORMAT *fmt, D3D11_VIDEO_DECODER_CONFIG *cfg, ID3D11VideoDecoder **dec) {
+    if (!pick_profile(vdev, yuv444, profile, fmt)) return 0;
+    if (!pick_config(vdev, profile, *fmt, w, h, cfg)) return 0;
     D3D11_VIDEO_DECODER_DESC desc;
     memset(&desc, 0, sizeof(desc));
     desc.Guid = *profile;
     desc.SampleWidth = w;
     desc.SampleHeight = h;
-    desc.OutputFormat = DXGI_FORMAT_AYUV;
+    desc.OutputFormat = *fmt;
     return SUCCEEDED(ID3D11VideoDevice_CreateVideoDecoder(vdev, &desc, cfg, dec));
 }
 
-int lansec_hevc_dxva_probe(void *d3d_device) {
+int lansec_hevc_dxva_probe(void *d3d_device, int yuv444) {
     if (!d3d_device) return 0;
     ID3D11Device *dev = (ID3D11Device *)d3d_device;
     ID3D11VideoDevice *vdev = NULL;
     if (FAILED(ID3D11Device_QueryInterface(dev, &IID_ID3D11VideoDevice, (void **)&vdev)) || !vdev) return 0;
     GUID profile;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     D3D11_VIDEO_DECODER_CONFIG cfg;
     ID3D11VideoDecoder *dec = NULL;
-    int ok = create_decoder(vdev, 1920, 1080, &profile, &cfg, &dec);
+    int ok = create_decoder(vdev, yuv444, 1920, 1080, &profile, &fmt, &cfg, &dec);
     if (dec) ID3D11VideoDecoder_Release(dec);
     ID3D11VideoDevice_Release(vdev);
     return ok;
 }
 
-void *lansec_hevc_dxva_open(void *d3d_device, void *d3d_ctx, uint32_t width, uint32_t height) {
+void *lansec_hevc_dxva_open(void *d3d_device, void *d3d_ctx, uint32_t width, uint32_t height, int yuv444) {
     if (!d3d_device || !d3d_ctx || width == 0 || height == 0) return NULL;
     DxvaDec *d = (DxvaDec *)calloc(1, sizeof(DxvaDec));
     if (!d) return NULL;
     d->device = (ID3D11Device *)d3d_device;
     d->ctx = (ID3D11DeviceContext *)d3d_ctx;
+    d->yuv444 = yuv444 ? 1 : 0;
     ID3D11Device_AddRef(d->device);
     ID3D11DeviceContext_AddRef(d->ctx);
     if (FAILED(ID3D11Device_QueryInterface(d->device, &IID_ID3D11VideoDevice, (void **)&d->vdev))) {
@@ -414,7 +430,7 @@ void *lansec_hevc_dxva_open(void *d3d_device, void *d3d_ctx, uint32_t width, uin
     }
     d->w = width;
     d->h = height;
-    if (!create_decoder(d->vdev, width, height, &d->profile, &d->config, &d->decoder)) {
+    if (!create_decoder(d->vdev, d->yuv444, width, height, &d->profile, &d->out_format, &d->config, &d->decoder)) {
         lansec_hevc_dxva_close(d);
         return NULL;
     }
@@ -424,7 +440,7 @@ void *lansec_hevc_dxva_open(void *d3d_device, void *d3d_ctx, uint32_t width, uin
     td.Height = height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_AYUV;
+    td.Format = d->out_format;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DECODER;
@@ -613,6 +629,8 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     }
     DXVA_PicParams_HEVC_RangeExt pp;
     fill_picparams(d, irap, idr, idr || irap, poc, slot, &pp);
+    const void *pp_ptr = d->yuv444 ? (const void *)&pp : (const void *)&pp.params;
+    UINT pp_size = d->yuv444 ? (UINT)sizeof(pp) : (UINT)sizeof(pp.params);
     DXVA_Slice_HEVC_Short sl;
     memset(&sl, 0, sizeof(sl));
     sl.BSNALunitDataLocation = 0;
@@ -621,7 +639,7 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
 
     HRESULT hr = ID3D11VideoContext_DecoderBeginFrame(d->vctx, d->decoder, d->view[slot], 0, NULL);
     if (FAILED(hr)) return -1;
-    hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, &pp, sizeof(pp));
+    hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, pp_ptr, pp_size);
     if (FAILED(hr)) goto fail;
     hr = copy_buf(d->vctx, d->decoder, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, &sl, sizeof(sl));
     if (FAILED(hr)) goto fail;
@@ -630,7 +648,7 @@ int lansec_hevc_dxva_decode(void *dec, const uint8_t *annexb, int len, void **ou
     D3D11_VIDEO_DECODER_BUFFER_DESC bd[3];
     memset(bd, 0, sizeof(bd));
     bd[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
-    bd[0].DataSize = sizeof(pp);
+    bd[0].DataSize = pp_size;
     bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
     bd[1].DataSize = sizeof(sl);
     bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;

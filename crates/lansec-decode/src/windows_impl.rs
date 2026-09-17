@@ -52,12 +52,13 @@ unsafe extern "C" {
 
 #[link(name = "lansec_hevc_dxva")]
 unsafe extern "C" {
-    fn lansec_hevc_dxva_probe(device: *mut std::ffi::c_void) -> i32;
+    fn lansec_hevc_dxva_probe(device: *mut std::ffi::c_void, yuv444: i32) -> i32;
     fn lansec_hevc_dxva_open(
         device: *mut std::ffi::c_void,
         ctx: *mut std::ffi::c_void,
         width: u32,
         height: u32,
+        yuv444: i32,
     ) -> *mut std::ffi::c_void;
     fn lansec_hevc_dxva_close(dec: *mut std::ffi::c_void);
     fn lansec_hevc_dxva_decode(
@@ -113,8 +114,16 @@ pub fn probe() -> Vec<CodecCap> {
             println!("hevc444_d3d11=false error={e}");
         }
     }
-    if !hevc_mft {
+    // Intel UHD often has DXVA Main (NV12) even when Store HEVC MFT is missing.
+    let dxva420 = match GpuContext::new() {
+        Ok(gpu) => unsafe { lansec_hevc_dxva_probe(gpu.device.as_raw(), 0) != 0 },
+        Err(_) => false,
+    };
+    if !hevc_mft && !dxva420 {
         return Vec::new();
+    }
+    if !hevc_mft && dxva420 {
+        info!("HEVC 4:2:0 via D3D11VA Main (no Media Foundation MFT)");
     }
     let mut caps = vec![CodecCap::decode(DecodeBackend::D3d11va, Chroma::Yuv420, 3840, 2160)];
     if probe444.as_ref().is_ok_and(|p| p.ok()) {
@@ -166,7 +175,7 @@ unsafe fn probe_hevc444() -> windows::core::Result<Hevc444Probe> {
         }
     };
     let mfx = lansec_mfx_probe_hevc444(gpu.device.as_raw()) != 0;
-    let dxva = lansec_hevc_dxva_probe(gpu.device.as_raw()) != 0;
+    let dxva = lansec_hevc_dxva_probe(gpu.device.as_raw(), 1) != 0;
     info!(mfx, dxva, "Intel HEVC 4:4:4 decode backends");
     Ok(Hevc444Probe {
         d3d11,
@@ -400,14 +409,15 @@ unsafe fn open_inner(
     if let Ok(mt) = gpu.device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);
     }
-    // 4:4:4: prefer HW-MFT; fall back to DXVA/MFX + VP CSC if MFT open fails.
-    // 4:2:0: try Sync MFT first, then the same HW-MFT path (Intel often has no Sync HEVC).
+    // 4:4:4: prefer HW-MFT; fall back to Main444 DXVA/MFX + VP CSC.
+    // 4:2:0: Sync/HW MFT, then Main+NV12 DXVA. Never open Main444 for a 420 stream
+    // (that is what caused white screen: decoder "ready" then dxva hevc444 -1).
     if chroma == Chroma::Yuv444 {
         match open_mf_hevc(gpu, chroma, width, height) {
             Ok(dec) => return Ok(dec),
             Err(e) => warn!("HW-MFT HEVC 4:4:4 open failed ({e}); trying D3D11VA/MFX"),
         }
-        if let Some(dec) = open_dxva(gpu, width, height) {
+        if let Some(dec) = open_dxva(gpu, width, height, true) {
             return Ok(dec);
         }
         if let Some(dec) = open_mfx(gpu, width, height) {
@@ -417,12 +427,9 @@ unsafe fn open_inner(
     }
     match open_mf_hevc(gpu, chroma, width, height) {
         Ok(dec) => return Ok(dec),
-        Err(e) => warn!("HEVC 4:2:0 MFT open failed ({e}); trying D3D11VA/MFX"),
+        Err(e) => warn!("HEVC 4:2:0 MFT open failed ({e}); trying D3D11VA Main/NV12"),
     }
-    if let Some(dec) = open_dxva(gpu, width, height) {
-        return Ok(dec);
-    }
-    if let Some(dec) = open_mfx(gpu, width, height) {
+    if let Some(dec) = open_dxva(gpu, width, height, false) {
         return Ok(dec);
     }
     Err(windows::core::Error::from(E_FAIL))
@@ -732,28 +739,32 @@ impl VideoCsc {
     }
 }
 
-fn open_dxva(gpu: &GpuContext, width: u32, height: u32) -> Option<Box<dyn HardwareDecoder>> {
+fn open_dxva(gpu: &GpuContext, width: u32, height: u32, yuv444: bool) -> Option<Box<dyn HardwareDecoder>> {
     let ptr = unsafe {
         lansec_hevc_dxva_open(
             gpu.device.as_raw(),
             gpu.context.as_raw(),
             width.max(1),
             height.max(1),
+            if yuv444 { 1 } else { 0 },
         )
     };
     if ptr.is_null() {
         return None;
     }
-    info!(width, height, "D3D11VA HEVC 4:4:4 decoder ready");
+    let chroma = if yuv444 { Chroma::Yuv444 } else { Chroma::Yuv420 };
+    let out = if yuv444 { "AYUV" } else { "NV12" };
+    info!(width, height, ?chroma, "D3D11VA HEVC decoder ready");
     let csc = VideoCsc::try_new(&gpu.device, &gpu.context, width.max(1), height.max(1)).ok();
     println!(
-        "hevc-decode backend=DXVA chroma=Yuv444 output=AYUV csc={}",
+        "hevc-decode backend=DXVA chroma={chroma:?} output={out} csc={}",
         csc.is_some()
     );
     Some(Box::new(DxvaDecoder {
         ptr,
         width: width.max(1),
         height: height.max(1),
+        yuv444,
         origin: Instant::now(),
         csc,
         device: gpu.device.clone(),
@@ -766,6 +777,7 @@ struct DxvaDecoder {
     ptr: *mut std::ffi::c_void,
     width: u32,
     height: u32,
+    yuv444: bool,
     origin: Instant,
     csc: Option<VideoCsc>,
     device: ID3D11Device,
@@ -795,7 +807,8 @@ impl HardwareDecoder for DxvaDecoder {
             lansec_hevc_dxva_decode(self.ptr, annexb.as_ptr(), annexb.len() as i32, &mut raw)
         };
         if rc < 0 {
-            return Err(DecodeError::Message(format!("dxva hevc444 {rc}")));
+            let tag = if self.yuv444 { "hevc444" } else { "hevc420" };
+            return Err(DecodeError::Message(format!("dxva {tag} {rc}")));
         }
         if rc == 0 || raw.is_null() {
             return Ok(None);
@@ -812,7 +825,7 @@ impl HardwareDecoder for DxvaDecoder {
                 }
             }
         } else {
-            warn!("DXVA 444 decode has no Video Processor CSC");
+            warn!("DXVA decode has no Video Processor CSC");
             return Ok(None);
         };
         if self.diag_frames < 3 {
@@ -825,10 +838,10 @@ impl HardwareDecoder for DxvaDecoder {
                 src = dxgi_format_label(src_desc.Format),
                 out = dxgi_format_label(out_desc.Format),
                 probe = ?probe,
-                "444 DXVA frame diag"
+                "DXVA frame diag"
             );
             println!(
-                "444-dxva diag frame={} src={} out={} probe={:?}",
+                "dxva diag frame={} src={} out={} probe={:?}",
                 self.diag_frames,
                 dxgi_format_label(src_desc.Format),
                 dxgi_format_label(out_desc.Format),
